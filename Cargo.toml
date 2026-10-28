@@ -1,0 +1,50 @@
+[package]
+name = "crisp-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Real-time microphone denoiser (RNNoise) with a lock-free, low-latency CPAL pipeline"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["audio", "dsp", "rnnoise", "denoise", "realtime"]
+categories = ["multimedia::audio", "command-line-utilities"]
+
+[[bin]]
+name = "crisp-rs"
+path = "src/main.rs"
+
+[dependencies]
+# Cross-platform audio I/O (ALSA / JACK / CoreAudio / WASAPI / ASIO).
+cpal = "0.15"
+# Pure-Rust port of RNNoise. Fixed 48 kHz / 480-sample frames.
+nnnoiseless = "0.5"
+# High-quality asynchronous sinc resampler (device rate <-> 48 kHz).
+rubato = "0.15"
+# Lock-free SPSC ring buffers shared between the audio callbacks and the DSP worker.
+ringbuf = "0.4"
+# CLI.
+clap = { version = "4.5", features = ["derive"] }
+# Ctrl+C / SIGTERM handling for graceful shutdown.
+ctrlc = { version = "3.4", features = ["termination"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+# Audio DSP is dominated by tight FP loops in nnnoiseless/rubato: let LLVM see
+# everything at once (fat LTO, single codegen unit) and vectorise aggressively.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"      # a panic inside an audio callback can never be recovered anyway
+debug = false
+strip = true
+incremental = false
+
+[profile.dev]
+# Un-optimised RNNoise/sinc code is too slow to keep up in real time, so even
+# `cargo run` (debug) gets a modest optimisation level for dependencies.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
