@@ -5,17 +5,13 @@
 //! crisp-rs run --input "USB Mic" --output "CABLE Input"
 //! ```
 
-mod audio_engine;
-mod denoiser;
-mod resampler;
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use audio_engine::EngineConfig;
+use crisp_rs::{audio_engine, EngineConfig};
 
 #[derive(Parser, Debug)]
 #[command(

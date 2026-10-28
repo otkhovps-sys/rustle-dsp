@@ -2,16 +2,30 @@
 name = "crisp-rs"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.82"
 description = "Real-time microphone denoiser (RNNoise) with a lock-free, low-latency CPAL pipeline"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["audio", "dsp", "rnnoise", "denoise", "realtime"]
 categories = ["multimedia::audio", "command-line-utilities"]
 
+[lib]
+name = "crisp_rs"
+path = "src/lib.rs"
+
 [[bin]]
 name = "crisp-rs"
 path = "src/main.rs"
+
+[[bin]]
+name = "crisp-gui"
+path = "src/bin/gui.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+# Desktop GUI (egui/eframe). Disable with `--no-default-features` for a CLI-only build.
+gui = ["dep:eframe", "dep:egui"]
 
 [dependencies]
 # Cross-platform audio I/O (ALSA / JACK / CoreAudio / WASAPI / ASIO).
@@ -29,6 +43,9 @@ ctrlc = { version = "3.4", features = ["termination"] }
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
+# Desktop GUI (optional, feature `gui`).
+eframe = { version = "0.31", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = { version = "0.31", optional = true }
 
 [profile.release]
 # Audio DSP is dominated by tight FP loops in nnnoiseless/rubato: let LLVM see

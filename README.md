@@ -1,6 +1,9 @@
 # crisp-rs
 
-Real-time microphone noise suppression as a small CLI / daemon, written in Rust.
+Real-time microphone noise suppression as a small CLI / daemon **and a desktop app**,
+written in Rust.
+
+![crisp-gui](docs/screenshot-gui.png)
 
 * Captures a microphone with [`cpal`](https://crates.io/crates/cpal)
 * Denoises with RNNoise via [`nnnoiseless`](https://crates.io/crates/nnnoiseless)
@@ -29,16 +32,45 @@ CPAL input cb            DSP worker thread                     CPAL output cb
   frames and converts between ±1.0 floats and the i16 range RNNoise expects.
 * `src/audio_engine.rs` – device selection, stream configuration, ring buffers,
   worker thread, latency clamp, graceful shutdown.
-* `src/main.rs` – `clap` CLI.
+* `src/main.rs` – `clap` CLI (`crisp-rs`).
+* `src/bin/gui.rs` – desktop GUI (`crisp-gui`, egui/eframe): device pickers, period /
+  sample-rate / bypass settings, Start/Stop, live mic & output meters, VAD, latency
+  budget and xrun counters. The UI thread only reads atomics; audio runs exactly the
+  same engine as the CLI.
+
+## Downloads
+
+Every push builds release binaries for Linux x86_64, Windows x86_64 and macOS
+(arm64 + x86_64) in GitHub Actions (`.github/workflows/build.yml`); grab them from the
+workflow run's **Artifacts**. Pushing a `v*` tag publishes them as a GitHub Release.
+Each archive contains both `crisp-rs` (CLI) and `crisp-gui` (desktop app).
 
 ## Build
 
 ```bash
-cargo build --release
+cargo build --release                       # CLI + GUI
+cargo build --release --no-default-features # CLI only (no egui)
 ```
 
 Linux needs the ALSA headers (`libasound2-dev` on Debian/Ubuntu, `alsa-lib-devel`
-on Fedora). macOS and Windows need nothing extra.
+on Fedora); the GUI additionally needs an OpenGL-capable X11/Wayland session at run
+time. macOS and Windows need nothing extra. Cross-compiling for Windows from Linux
+works with `rustup target add x86_64-pc-windows-gnu` + `gcc-mingw-w64-x86-64`.
+
+## Desktop app
+
+```bash
+crisp-gui
+```
+
+1. Pick the microphone and the output device (speakers to monitor, or a virtual
+   cable such as VB-Cable / BlackHole / a PipeWire null sink to feed other apps).
+2. Optionally change the period size (latency vs. robustness) or force a sample rate.
+3. **Start**. The meters show input/output level, voice-activity probability, the
+   estimated latency budget and the xrun counters. **Stop** (or closing the window)
+   flushes the pipeline before exiting.
+
+The GUI embeds DejaVu Sans so Vietnamese labels render correctly on every platform.
 
 ## Usage
 

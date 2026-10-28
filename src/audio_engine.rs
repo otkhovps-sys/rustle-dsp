@@ -80,12 +80,39 @@ pub struct Metrics {
     /// Last RNNoise VAD probability (f32 bits).
     pub vad_bits: AtomicU32,
     pub frames_processed: AtomicU64,
+    /// Peak |sample| seen by the last input / output callback (f32 bits).
+    pub in_peak_bits: AtomicU32,
+    pub out_peak_bits: AtomicU32,
+    /// Errors reported by CPAL on either stream (device unplugged, ...).
+    pub stream_errors: AtomicU64,
 }
 
 impl Metrics {
     pub fn vad(&self) -> f32 {
         f32::from_bits(self.vad_bits.load(Ordering::Relaxed))
     }
+    pub fn in_peak(&self) -> f32 {
+        f32::from_bits(self.in_peak_bits.load(Ordering::Relaxed))
+    }
+    pub fn out_peak(&self) -> f32 {
+        f32::from_bits(self.out_peak_bits.load(Ordering::Relaxed))
+    }
+}
+
+/// Snapshot of all counters, convenient for UIs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MetricsSnapshot {
+    pub frames_processed: u64,
+    pub vad: f32,
+    pub in_peak: f32,
+    pub out_peak: f32,
+    pub in_fill_ms: f64,
+    pub out_fill_ms: f64,
+    pub input_overruns: u64,
+    pub output_underruns: u64,
+    pub output_overruns: u64,
+    pub dropped_samples: u64,
+    pub stream_errors: u64,
 }
 
 /// Control flags for shutdown sequencing.
@@ -193,6 +220,66 @@ pub fn list_devices() -> Result<()> {
     println!();
     println!("* = default device. Select with --input/--output by index or name substring.");
     Ok(())
+}
+
+/// One entry of the device catalog used by UIs. `index` is what
+/// `EngineConfig::input/output` accept as a selector.
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub index: usize,
+    pub name: String,
+    pub is_default: bool,
+    pub default_rate: Option<u32>,
+    pub default_channels: Option<u16>,
+}
+
+impl DeviceInfo {
+    pub fn label(&self) -> String {
+        let mut l = self.name.clone();
+        if let (Some(r), Some(c)) = (self.default_rate, self.default_channels) {
+            l.push_str(&format!("  ({r} Hz, {c} ch)"));
+        }
+        if self.is_default {
+            l.push_str("  [default]");
+        }
+        l
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeviceCatalog {
+    pub host: String,
+    pub inputs: Vec<DeviceInfo>,
+    pub outputs: Vec<DeviceInfo>,
+}
+
+/// Enumerate devices of the default host (same indices as `list`).
+pub fn device_catalog() -> DeviceCatalog {
+    let host = cpal::default_host();
+    let collect = |dir: Direction| -> Vec<DeviceInfo> {
+        let default_name = default_device_for(&host, dir).and_then(|d| d.name().ok());
+        devices_for(&host, dir)
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(index, dev)| {
+                let name = dev.name().unwrap_or_else(|_| format!("device {index}"));
+                let cfg = default_config_for(dev, dir).ok();
+                DeviceInfo {
+                    index,
+                    is_default: Some(&name) == default_name.as_ref(),
+                    default_rate: cfg.as_ref().map(|c| c.sample_rate().0),
+                    default_channels: cfg.as_ref().map(|c| c.channels()),
+                    name,
+                }
+            })
+            .collect()
+    };
+    DeviceCatalog {
+        host: format!("{:?}", host.id()),
+        inputs: collect(Direction::Input),
+        outputs: collect(Direction::Output),
+    }
 }
 
 fn capitalize(s: &str) -> String {
@@ -394,9 +481,11 @@ where
     let channels = usize::from(config.channels).max(1);
     let inv_channels = 1.0 / channels as f32;
 
+    let err_metrics = metrics.clone();
     let data_cb = move |data: &[T], _: &cpal::InputCallbackInfo| {
         // RT-safe: only arithmetic, a wait-free push per frame, relaxed atomics.
         let mut overrun = false;
+        let mut peak = 0.0f32;
         for frame in data.chunks_exact(channels) {
             // Downmix: arithmetic mean of all channels. Equal-weight averaging
             // keeps a mono source recorded on both channels at unity gain.
@@ -404,18 +493,24 @@ where
             for s in frame {
                 acc += f32::from_sample(*s);
             }
-            if prod.try_push(acc * inv_channels).is_err() {
+            let mono = acc * inv_channels;
+            peak = peak.max(mono.abs());
+            if prod.try_push(mono).is_err() {
                 overrun = true;
             }
         }
         if overrun {
             metrics.input_overruns.fetch_add(1, Ordering::Relaxed);
         }
+        metrics.in_peak_bits.store(peak.to_bits(), Ordering::Relaxed);
         // Wake the DSP worker. Futex wake = non-blocking for us.
         worker.unpark();
     };
 
-    let err_cb = |e: cpal::StreamError| error!("input stream error: {e}");
+    let err_cb = move |e: cpal::StreamError| {
+        err_metrics.stream_errors.fetch_add(1, Ordering::Relaxed);
+        error!("input stream error: {e}");
+    };
     device
         .build_input_stream(config, data_cb, err_cb, None)
         .context("building input stream")
@@ -436,6 +531,7 @@ where
 {
     let channels = usize::from(config.channels).max(1);
     let silence = T::from_sample(0.0f32);
+    let err_metrics = metrics.clone();
 
     // Priming: stay silent until the worker has queued `prime_frames`. That
     // backlog is the jitter margin that absorbs the 10 ms burstiness of
@@ -459,6 +555,7 @@ where
         }
 
         let mut underrun = false;
+        let mut peak = 0.0f32;
         for frame in data.chunks_exact_mut(channels) {
             let s = match cons.try_pop() {
                 Some(s) => s,
@@ -467,6 +564,7 @@ where
                     0.0
                 }
             };
+            peak = peak.max(s.abs());
             let v = T::from_sample(s);
             // Mono -> M channels: identical sample on every channel.
             for out in frame.iter_mut() {
@@ -480,13 +578,17 @@ where
             data[n - rem..].fill(silence);
         }
 
+        metrics.out_peak_bits.store(peak.to_bits(), Ordering::Relaxed);
         if underrun && !draining {
             metrics.output_underruns.fetch_add(1, Ordering::Relaxed);
             primed = false;
         }
     };
 
-    let err_cb = |e: cpal::StreamError| error!("output stream error: {e}");
+    let err_cb = move |e: cpal::StreamError| {
+        err_metrics.stream_errors.fetch_add(1, Ordering::Relaxed);
+        error!("output stream error: {e}");
+    };
     device
         .build_output_stream(config, data_cb, err_cb, None)
         .context("building output stream")
@@ -766,14 +868,232 @@ fn ms(frames: usize, rate: u32) -> f64 {
     frames as f64 * 1000.0 / f64::from(rate)
 }
 
-fn fmt_buffer(spec: &StreamSpec) -> String {
-    match spec.buffer_frames {
-        Some(n) => format!("{n} frames ({:.2} ms)", ms(n as usize, spec.rate())),
-        None => "backend default".into(),
+/// Estimated one-way latency, mic -> output, broken down per stage (ms).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LatencyBudget {
+    pub input_period_ms: f64,
+    pub rnnoise_frame_ms: f64,
+    /// max(input period, RNNoise frame): the two overlap.
+    pub input_side_ms: f64,
+    pub resample_in_ms: f64,
+    pub resample_out_ms: f64,
+    pub output_queue_ms: f64,
+    pub output_queue_frames: usize,
+    pub output_period_ms: f64,
+    pub total_ms: f64,
+}
+
+/// Everything a UI wants to know about a running engine.
+#[derive(Debug, Clone)]
+pub struct EngineInfo {
+    pub host: String,
+    pub input_name: String,
+    pub output_name: String,
+    pub input_rate: u32,
+    pub output_rate: u32,
+    pub input_channels: usize,
+    pub output_channels: usize,
+    pub input_format: String,
+    pub output_format: String,
+    pub input_period: Option<u32>,
+    pub output_period: Option<u32>,
+    pub bypass: bool,
+    pub latency: LatencyBudget,
+}
+
+/// A running pipeline. Dropping the handle stops it gracefully.
+///
+/// CPAL streams are `!Send`, so they live on a dedicated control thread owned
+/// by this handle; `start()` returns once the streams are playing and
+/// `stop()` performs the ordered shutdown (stop capture → flush DSP → drain
+/// output → stop playback).
+pub struct Engine {
+    info: EngineInfo,
+    metrics: Arc<Metrics>,
+    stop_flag: Arc<AtomicBool>,
+    control: Option<JoinHandle<Result<()>>>,
+}
+
+enum ControlMsg {
+    Ready(Box<EngineInfo>),
+    Failed(anyhow::Error),
+}
+
+impl Engine {
+    /// Open the devices, start the worker and both streams.
+    pub fn start(cfg: EngineConfig) -> Result<Engine> {
+        let metrics = Arc::new(Metrics::default());
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<ControlMsg>();
+
+        let thread_metrics = metrics.clone();
+        let thread_stop = stop_flag.clone();
+        let control = thread::Builder::new()
+            .name("crisp-control".into())
+            .spawn(move || control_thread(cfg, thread_metrics, thread_stop, tx))
+            .context("spawning control thread")?;
+
+        match rx.recv() {
+            Ok(ControlMsg::Ready(info)) => Ok(Engine {
+                info: *info,
+                metrics,
+                stop_flag,
+                control: Some(control),
+            }),
+            Ok(ControlMsg::Failed(e)) => {
+                let _ = control.join();
+                Err(e)
+            }
+            Err(_) => {
+                // Thread died before reporting (panic).
+                match control.join() {
+                    Ok(Ok(())) => bail!("control thread exited before the engine started"),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => bail!("control thread panicked during start-up"),
+                }
+            }
+        }
+    }
+
+    pub fn info(&self) -> &EngineInfo {
+        &self.info
+    }
+
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        snapshot(&self.metrics, self.info.input_rate, self.info.output_rate)
+    }
+
+    /// True once the control thread has exited (after `stop()` or a fatal error).
+    pub fn is_finished(&self) -> bool {
+        self.control.as_ref().is_none_or(|h| h.is_finished())
+    }
+
+    /// Ask the pipeline to stop without waiting (poll `is_finished()`).
+    pub fn request_stop(&self) {
+        self.stop_flag.store(true, Ordering::Release);
+        if let Some(h) = &self.control {
+            h.thread().unpark();
+        }
+    }
+
+    /// Graceful shutdown; blocks until the output queue has drained (≤ ~0.6 s).
+    pub fn stop(mut self) -> Result<()> {
+        self.shutdown()
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.request_stop();
+        match self.control.take() {
+            Some(h) => h
+                .join()
+                .map_err(|_| anyhow!("control thread panicked"))?,
+            None => Ok(()),
+        }
     }
 }
 
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Err(e) = self.shutdown() {
+            error!("engine shutdown: {e:#}");
+        }
+    }
+}
+
+/// Convenience for the CLI: run until `running` is cleared, logging stats.
 pub fn run(cfg: EngineConfig, running: Arc<AtomicBool>) -> Result<()> {
+    let stats_secs = cfg.stats_secs;
+    let engine = Engine::start(cfg)?;
+    log_info(engine.info());
+    info!("running — press Ctrl+C to stop");
+
+    let stats_every = (stats_secs > 0).then(|| Duration::from_secs(stats_secs));
+    let mut last_stats = Instant::now();
+    while running.load(Ordering::Relaxed) && !engine.is_finished() {
+        thread::sleep(Duration::from_millis(50));
+        if let Some(every) = stats_every {
+            if last_stats.elapsed() >= every {
+                last_stats = Instant::now();
+                log_stats(&engine.snapshot());
+            }
+        }
+    }
+
+    info!("shutting down");
+    let snap = engine.snapshot();
+    engine.stop()?;
+    log_stats(&snap);
+    info!("stopped cleanly");
+    Ok(())
+}
+
+/// Owns the CPAL streams for their whole lifetime.
+fn control_thread(
+    cfg: EngineConfig,
+    metrics: Arc<Metrics>,
+    stop_flag: Arc<AtomicBool>,
+    tx: std::sync::mpsc::Sender<ControlMsg>,
+) -> Result<()> {
+    let started = match start_pipeline(&cfg, metrics.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let _ = tx.send(ControlMsg::Failed(e));
+            bail!("{msg}");
+        }
+    };
+    let Started {
+        in_stream,
+        out_stream,
+        worker,
+        ctl,
+        info,
+    } = started;
+
+    if tx.send(ControlMsg::Ready(Box::new(info))).is_err() {
+        // Nobody is listening any more; shut down right away.
+        stop_flag.store(true, Ordering::Release);
+    }
+
+    // Wait for a stop request (or the worker dying).
+    while !stop_flag.load(Ordering::Acquire) && !worker.is_finished() {
+        thread::park_timeout(Duration::from_millis(100));
+    }
+
+    // ---- Graceful shutdown ----------------------------------------------------
+    // 1. Stop capturing: no new samples enter the pipeline.
+    drop(in_stream);
+    // 2. Tell the worker to process + flush whatever is left and exit.
+    ctl.stop.store(true, Ordering::Release);
+    worker.thread().unpark();
+    let worker_result = worker
+        .join()
+        .map_err(|_| anyhow!("DSP worker thread panicked"));
+    // 3. Let the output play out the remaining queued audio (bypass priming).
+    ctl.draining.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while metrics.out_fill.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    // 4. Stop playback.
+    drop(out_stream);
+
+    worker_result?
+}
+
+struct Started {
+    in_stream: Stream,
+    out_stream: Stream,
+    worker: JoinHandle<Result<()>>,
+    ctl: Arc<Control>,
+    info: EngineInfo,
+}
+
+fn start_pipeline(cfg: &EngineConfig, metrics: Arc<Metrics>) -> Result<Started> {
     let host = cpal::default_host();
     info!("audio host: {:?}", host.id());
 
@@ -786,22 +1106,6 @@ pub fn run(cfg: EngineConfig, running: Arc<AtomicBool>) -> Result<()> {
     let mut out_spec =
         choose_config(&out_dev, Direction::Output, cfg.force_rate, cfg.buffer_frames)?;
 
-    info!(
-        "input : {in_name} @ {} Hz, {} ch, {:?}, period {}",
-        in_spec.rate(),
-        in_spec.channels(),
-        in_spec.format,
-        fmt_buffer(&in_spec)
-    );
-    info!(
-        "output: {out_name} @ {} Hz, {} ch, {:?}, period {}",
-        out_spec.rate(),
-        out_spec.channels(),
-        out_spec.format,
-        fmt_buffer(&out_spec)
-    );
-
-    let metrics = Arc::new(Metrics::default());
     let ctl = Arc::new(Control::default());
 
     // Streams are built in a small retry loop because a backend may reject
@@ -899,57 +1203,35 @@ pub fn run(cfg: EngineConfig, running: Arc<AtomicBool>) -> Result<()> {
         break (in_stream, out_stream, worker, prime);
     };
 
-    print_latency_budget(&in_spec, &out_spec, prime_frames, cfg.bypass);
+    let latency = latency_budget(&in_spec, &out_spec, prime_frames);
+    let info = EngineInfo {
+        host: format!("{:?}", host.id()),
+        input_name: in_name,
+        output_name: out_name,
+        input_rate: in_spec.rate(),
+        output_rate: out_spec.rate(),
+        input_channels: in_spec.channels(),
+        output_channels: out_spec.channels(),
+        input_format: format!("{:?}", in_spec.format),
+        output_format: format!("{:?}", out_spec.format),
+        input_period: in_spec.buffer_frames,
+        output_period: out_spec.buffer_frames,
+        bypass: cfg.bypass,
+        latency,
+    };
 
     // Start output first so it is already waiting (silently, un-primed) when
     // the first input period arrives.
     out_stream.play().context("starting output stream")?;
     in_stream.play().context("starting input stream")?;
-    info!("running — press Ctrl+C to stop");
 
-    // ---- Main loop: just report stats until asked to stop -----------------
-    let stats_every = if cfg.stats_secs == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(cfg.stats_secs))
-    };
-    let mut last_stats = Instant::now();
-    while running.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(50));
-        if let Some(every) = stats_every {
-            if last_stats.elapsed() >= every {
-                last_stats = Instant::now();
-                log_stats(&metrics, in_spec.rate(), out_spec.rate());
-            }
-        }
-        if worker.is_finished() {
-            break;
-        }
-    }
-
-    // ---- Graceful shutdown --------------------------------------------------
-    info!("shutting down");
-    // 1. Stop capturing: no new samples enter the pipeline.
-    drop(in_stream);
-    // 2. Tell the worker to process + flush whatever is left and exit.
-    ctl.stop.store(true, Ordering::Release);
-    worker.thread().unpark();
-    let worker_result = worker
-        .join()
-        .map_err(|_| anyhow!("DSP worker thread panicked"))?;
-    // 3. Let the output play out the remaining queued audio (bypass priming).
-    ctl.draining.store(true, Ordering::Release);
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while metrics.out_fill.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(5));
-    }
-    // 4. Stop playback.
-    drop(out_stream);
-
-    log_stats(&metrics, in_spec.rate(), out_spec.rate());
-    worker_result?;
-    info!("stopped cleanly");
-    Ok(())
+    Ok(Started {
+        in_stream,
+        out_stream,
+        worker,
+        ctl,
+        info,
+    })
 }
 
 fn stop_worker(ctl: &Arc<Control>, worker: JoinHandle<Result<()>>, thread: &Thread) {
@@ -960,57 +1242,118 @@ fn stop_worker(ctl: &Arc<Control>, worker: JoinHandle<Result<()>>, thread: &Thre
     ctl.drained.store(false, Ordering::Release);
 }
 
-fn print_latency_budget(in_spec: &StreamSpec, out_spec: &StreamSpec, prime: usize, bypass: bool) {
+fn latency_budget(in_spec: &StreamSpec, out_spec: &StreamSpec, prime: usize) -> LatencyBudget {
     let in_rate = in_spec.rate();
     let out_rate = out_spec.rate();
-    let in_period = in_spec
+    let input_period_ms = in_spec
         .buffer_frames
         .map(|n| ms(n as usize, in_rate))
         .unwrap_or(10.0);
-    let out_period = out_spec
+    let output_period_ms = out_spec
         .buffer_frames
         .map(|n| ms(n as usize, out_rate))
         .unwrap_or(10.0);
-    let rnnoise_frame = ms(FRAME_SIZE, RNNOISE_RATE);
-    let resample_in = StreamResampler::new(in_rate, RNNOISE_RATE)
+    let rnnoise_frame_ms = ms(FRAME_SIZE, RNNOISE_RATE);
+    let resample_in_ms = StreamResampler::new(in_rate, RNNOISE_RATE)
         .map(|r| r.latency_ms())
         .unwrap_or(0.0);
-    let resample_out = StreamResampler::new(RNNOISE_RATE, out_rate)
+    let resample_out_ms = StreamResampler::new(RNNOISE_RATE, out_rate)
         .map(|r| r.latency_ms())
         .unwrap_or(0.0);
-    let prime_ms = ms(prime, out_rate);
+    let output_queue_ms = ms(prime, out_rate);
 
     // Input period and RNNoise framing overlap: a sample waits until its
     // 480-frame block is complete, which already includes waiting for the
     // input period that delivers it. So the input side costs max(period, frame).
-    let input_side = in_period.max(rnnoise_frame);
-    let total = input_side + resample_in + resample_out + prime_ms + out_period;
+    let input_side_ms = input_period_ms.max(rnnoise_frame_ms);
+    let total_ms =
+        input_side_ms + resample_in_ms + resample_out_ms + output_queue_ms + output_period_ms;
 
+    LatencyBudget {
+        input_period_ms,
+        rnnoise_frame_ms,
+        input_side_ms,
+        resample_in_ms,
+        resample_out_ms,
+        output_queue_ms,
+        output_queue_frames: prime,
+        output_period_ms,
+        total_ms,
+    }
+}
+
+fn log_info(info: &EngineInfo) {
+    let period = |p: Option<u32>, rate: u32| match p {
+        Some(n) => format!("{n} frames ({:.2} ms)", ms(n as usize, rate)),
+        None => "backend default".into(),
+    };
+    info!(
+        "input : {} @ {} Hz, {} ch, {}, period {}",
+        info.input_name,
+        info.input_rate,
+        info.input_channels,
+        info.input_format,
+        period(info.input_period, info.input_rate)
+    );
+    info!(
+        "output: {} @ {} Hz, {} ch, {}, period {}",
+        info.output_name,
+        info.output_rate,
+        info.output_channels,
+        info.output_format,
+        period(info.output_period, info.output_rate)
+    );
+    let l = &info.latency;
     info!("latency budget (mic -> output, worst case, excluding driver/hardware):");
-    info!("  input period + RNNoise framing : {:>6.2} ms  (max of {:.2} ms, {:.2} ms)", input_side, in_period, rnnoise_frame);
-    info!("  resampler in  ({} -> 48000)    : {:>6.2} ms", in_rate, resample_in);
-    info!("  resampler out (48000 -> {})    : {:>6.2} ms", out_rate, resample_out);
-    info!("  output queue (priming level)   : {:>6.2} ms  ({} frames)", prime_ms, prime);
-    info!("  output period                  : {:>6.2} ms", out_period);
-    info!("  ≈ total                        : {:>6.2} ms{}", total, if bypass { "  [RNNoise bypassed]" } else { "" });
-    if total > 25.0 {
+    info!(
+        "  input period + RNNoise framing : {:>6.2} ms  (max of {:.2} ms, {:.2} ms)",
+        l.input_side_ms, l.input_period_ms, l.rnnoise_frame_ms
+    );
+    info!("  resampler in  ({} -> 48000)    : {:>6.2} ms", info.input_rate, l.resample_in_ms);
+    info!("  resampler out (48000 -> {})    : {:>6.2} ms", info.output_rate, l.resample_out_ms);
+    info!(
+        "  output queue (priming level)   : {:>6.2} ms  ({} frames)",
+        l.output_queue_ms, l.output_queue_frames
+    );
+    info!("  output period                  : {:>6.2} ms", l.output_period_ms);
+    info!(
+        "  ≈ total                        : {:>6.2} ms{}",
+        l.total_ms,
+        if info.bypass { "  [RNNoise bypassed]" } else { "" }
+    );
+    if l.total_ms > 25.0 {
         warn!("estimated latency exceeds 25 ms; try a smaller --buffer-frames or a 48 kHz device");
     }
 }
 
-fn log_stats(m: &Metrics, in_rate: u32, out_rate: u32) {
-    let in_fill = m.in_fill.load(Ordering::Relaxed);
-    let out_fill = m.out_fill.load(Ordering::Relaxed);
+fn snapshot(m: &Metrics, in_rate: u32, out_rate: u32) -> MetricsSnapshot {
+    MetricsSnapshot {
+        frames_processed: m.frames_processed.load(Ordering::Relaxed),
+        vad: m.vad(),
+        in_peak: m.in_peak(),
+        out_peak: m.out_peak(),
+        in_fill_ms: ms(m.in_fill.load(Ordering::Relaxed), in_rate),
+        out_fill_ms: ms(m.out_fill.load(Ordering::Relaxed), out_rate),
+        input_overruns: m.input_overruns.load(Ordering::Relaxed),
+        output_underruns: m.output_underruns.load(Ordering::Relaxed),
+        output_overruns: m.output_overruns.load(Ordering::Relaxed),
+        dropped_samples: m.dropped_samples.load(Ordering::Relaxed),
+        stream_errors: m.stream_errors.load(Ordering::Relaxed),
+    }
+}
+
+fn log_stats(s: &MetricsSnapshot) {
     info!(
-        "stats: frames={} vad={:.2} in_q={:.1}ms out_q={:.1}ms | in_overrun={} out_underrun={} out_overrun={} dropped={}",
-        m.frames_processed.load(Ordering::Relaxed),
-        m.vad(),
-        ms(in_fill, in_rate),
-        ms(out_fill, out_rate),
-        m.input_overruns.load(Ordering::Relaxed),
-        m.output_underruns.load(Ordering::Relaxed),
-        m.output_overruns.load(Ordering::Relaxed),
-        m.dropped_samples.load(Ordering::Relaxed),
+        "stats: frames={} vad={:.2} in_q={:.1}ms out_q={:.1}ms | in_overrun={} out_underrun={} out_overrun={} dropped={} errors={}",
+        s.frames_processed,
+        s.vad,
+        s.in_fill_ms,
+        s.out_fill_ms,
+        s.input_overruns,
+        s.output_underruns,
+        s.output_overruns,
+        s.dropped_samples,
+        s.stream_errors,
     );
 }
 
