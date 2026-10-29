@@ -7,12 +7,14 @@ written in Rust.
 
 * Captures a microphone with [`cpal`](https://crates.io/crates/cpal)
 * Denoises with RNNoise via [`nnnoiseless`](https://crates.io/crates/nnnoiseless)
-* Plays the clean signal to any output device (speakers or a virtual cable such as
-  VB-Cable / BlackHole / PipeWire null sink) so it can be used as a "clean mic" in
-  Discord, Zoom, OBS, ...
-* Designed for **< 25 ms** mic-to-output latency with **no xruns**: lock-free SPSC ring
-  buffers between the audio callbacks and a dedicated DSP thread, no allocation and
-  no locks in the real-time callbacks.
+* **Virtual microphone mode**: the clean signal appears as a new input device
+  ("Crisp Mic (denoised)" on Linux, VB-Cable / BlackHole on Windows / macOS) that
+  Discord, Zoom, Meet, Teams or OBS select as their microphone.
+* Monitor mode plays the clean signal on speakers / headphones for testing.
+* ~23 ms mic-to-output latency at 48 kHz with lock-free SPSC ring buffers between the
+  audio callbacks and a dedicated DSP thread, no allocation and no locks in the
+  real-time callbacks, and drift correction that keeps latency bounded without
+  crackling on bursty sound servers.
 
 ## Pipeline
 
@@ -61,18 +63,43 @@ on Fedora); the GUI additionally needs an OpenGL-capable X11/Wayland session at 
 time. macOS and Windows need nothing extra. Cross-compiling for Windows from Linux
 works with `rustup target add x86_64-pc-windows-gnu` + `gcc-mingw-w64-x86-64`.
 
+## Virtual microphone (use it in Discord / Zoom / Meet / Teams / OBS)
+
+```
+real mic ──► crisp-rs (RNNoise) ──► virtual mic ──► chat app selects it as "Microphone"
+```
+
+| OS | What crisp-rs does | One-time setup |
+|---|---|---|
+| Linux (PulseAudio or PipeWire) | Creates **"Crisp Mic (denoised)"** itself (`module-null-sink` + `module-remap-source` via `pactl`), routes its output there, removes it on exit. | none (`pactl` must exist: `pulseaudio-utils` or `pipewire-pulse`) |
+| Windows | Sends audio to **CABLE Input**; chat apps select **CABLE Output (VB-Audio Virtual Cable)**. | install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (free) |
+| macOS | Sends audio to **BlackHole 2ch**; chat apps select **BlackHole 2ch**. | install [BlackHole](https://existential.audio/blackhole/) (free) |
+
+Windows and macOS only let signed drivers create audio devices, which an application
+cannot ship, hence the one-time cable install. crisp-rs detects the cable automatically.
+
+Then in the chat app: **Settings → Audio → Microphone / Input → the name above**, and
+turn off the app's own noise suppression (Krisp etc.) so the voice is not processed twice.
+
+On Linux the ALSA plugin of the sound server re-creates its stream after every xrun;
+crisp-rs listens to `pactl subscribe` and moves every new stream of its own process
+onto the virtual mic within milliseconds, so routing survives glitches and restarts.
+
 ## Desktop app
 
 ```bash
 crisp-gui
 ```
 
-1. Pick the microphone and the output device (speakers to monitor, or a virtual
-   cable such as VB-Cable / BlackHole / a PipeWire null sink to feed other apps).
-2. Optionally change the period size (latency vs. robustness) or force a sample rate.
-3. **Start**. The meters show input/output level, voice-activity probability, the
-   estimated latency budget and the xrun counters. **Stop** (or closing the window)
-   flushes the pipeline before exiting.
+1. Mode **Micro ảo** (virtual mic, default) or **Nghe thử** (monitor on speakers).
+2. Pick the real microphone. Virtual mics are hidden from the input list to prevent
+   feedback loops.
+3. **Bắt đầu lọc ồn** (Start). A green box shows the exact device name to select in
+   the chat app, with a copy button. The meters show input / output level and the
+   voice-activity probability; "Chi tiết pipeline" shows the latency budget and
+   xrun counters.
+4. Settings (mode, devices by name, period, rate, auto-start on launch) are saved.
+   Closing the window stops gracefully and removes the Linux virtual mic.
 
 The GUI embeds DejaVu Sans so Vietnamese labels render correctly on every platform.
 
@@ -82,7 +109,10 @@ The GUI embeds DejaVu Sans so Vietnamese labels render correctly on every platfo
 # list devices (index + name, default marked with *)
 crisp-rs list
 
-# default mic → default speakers
+# default mic → virtual microphone for chat apps
+crisp-rs run --virtual-mic
+
+# default mic → default speakers (monitor / testing)
 crisp-rs run
 
 # pick devices by index or (case-insensitive) name substring
@@ -99,45 +129,58 @@ crisp-rs run --buffer-frames 64
 ```
 
 `Ctrl+C` (or `SIGTERM`) stops capture, flushes the resamplers and the last partial
-RNNoise frame, lets the output queue drain, and exits. A second `Ctrl+C` exits
-immediately.
+RNNoise frame, lets the output queue drain, removes the Linux virtual mic and exits.
+A second `Ctrl+C` exits immediately (a left-over virtual mic is adopted and cleaned up
+by the next run).
 
 ## Latency budget
 
 Printed at start-up, e.g. for a 48 kHz device with 128-frame periods:
 
 ```
-input period + RNNoise framing :  10.00 ms  (max of 2.67 ms, 10.00 ms)
+input period + RNNoise framing :  12.67 ms  (2.67 + 10.00 ms)
 resampler in  (48000 -> 48000)  :   0.00 ms
 resampler out (48000 -> 48000)  :   0.00 ms
-output queue (priming level)    :   7.67 ms  (368 frames)
+output queue (steady state)     :   7.67 ms  (primes at 848 frames)
 output period                   :   2.67 ms
-≈ total                         :  20.33 ms
+≈ total                         :  23.00 ms
 ```
+
+| Devices | Period | Estimated latency |
+|---|---|---|
+| 48 kHz both ends | 128 | 23.0 ms |
+| 44.1 kHz both ends (resampled) | 128 | 27.9 ms |
+| 44.1 kHz both ends (resampled) | 64 | ≈ 23.5 ms |
 
 Where the numbers come from:
 
-* **RNNoise frame** – 480 samples = 10 ms; a sample can wait up to one frame before
-  the network runs. This dominates and cannot be reduced.
-* **Device period** – `--buffer-frames` (default 128 = 2.67 ms @ 48 kHz) per direction.
-* **Output priming** – the output stays silent until `period + 240` frames are queued.
-  That half-frame margin absorbs worker scheduling jitter so the 10 ms bursts of
-  RNNoise output never starve the output callback.
+* **RNNoise framing** – 480 samples = 10 ms, counted once for the whole chain: a sample
+  at position *x* of a frame waits (480 − *x*) for the frame to complete and then *x*
+  while that chunk drains on the output, i.e. exactly 10 ms for every sample.
+* **Device periods** – `--buffer-frames` (default 128 = 2.67 ms @ 48 kHz) per direction.
+* **Output queue** – the pacer steers the queue's low point to half a frame (5 ms of
+  jitter margin for the DSP thread); it sits up to one period above that depending
+  on phase. Playback starts once `period + 480 + 240` frames are queued, which
+  guarantees that low point whatever the phase between worker and device.
 * **Resampler** – only when a device cannot run at 48 kHz: sinc group delay
-  (32 frames) + chunk gathering (64 frames) ≈ 2 ms per direction. With both ends
-  at 44.1 kHz the printed worst case is ≈ 24.5 ms (the average sample sees ~5 ms less,
-  since RNNoise framing is 0–10 ms depending on position in the frame).
+  (32 frames) + chunk gathering (64 frames) ≈ 2 ms per direction.
 
 ### Run-time safeguards
 
-* **Latency clamp** – clock drift between two devices (or a long scheduler stall)
-  would otherwise make the queues grow forever. When the input backlog exceeds ~40 ms,
-  or the output queue exceeds the priming level by two frames, the oldest input is
-  dropped (one small click, bounded latency, counted in `dropped`).
-* **Underrun handling** – the output callback emits silence and re-primes, so a single
-  stall produces one gap instead of continuous crackling.
-* `--stats-secs N` logs frames processed, VAD probability, queue depths and all
-  overrun/underrun/drop counters.
+* **Drift correction** – sound servers pull audio in irregular bursts, so the queue
+  swings by several periods without anything being wrong. crisp-rs therefore watches
+  the queue's *minimum* over ~1 s windows; only if it stays more than 10 ms above the
+  5 ms floor (two devices with different clocks) is the excess dropped, in one step.
+  Simulated 120 s at +0.1 % clock drift: 0 underruns, final queue 10 ms.
+* **Hard cap** – whatever the devices do, the output queue is trimmed immediately if
+  it exceeds the priming level by 250 ms.
+* **Stall recovery** – if the DSP thread was not scheduled for > 250 ms, the input
+  backlog is trimmed instead of being played late.
+* **Underrun handling** – the output callback emits silence and re-primes, so a stall
+  produces one short gap instead of continuous crackling. Simulated 60 s at −0.1 %
+  drift: 6 short re-primes.
+* `--stats-secs N` logs frames processed, VAD probability, queue depths, the largest
+  callback sizes and all overrun/underrun/drop counters.
 
 ## Tuning tips
 

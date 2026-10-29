@@ -85,6 +85,11 @@ pub struct Metrics {
     pub out_peak_bits: AtomicU32,
     /// Errors reported by CPAL on either stream (device unplugged, ...).
     pub stream_errors: AtomicU64,
+    /// Largest number of frames requested by a single input / output callback.
+    /// Sound-server plugins (PulseAudio/PipeWire ALSA plugins) often use much
+    /// bigger and irregular chunks than the requested period.
+    pub in_cb_max: AtomicUsize,
+    pub out_cb_max: AtomicUsize,
 }
 
 impl Metrics {
@@ -113,6 +118,8 @@ pub struct MetricsSnapshot {
     pub output_overruns: u64,
     pub dropped_samples: u64,
     pub stream_errors: u64,
+    pub in_cb_max: usize,
+    pub out_cb_max: usize,
 }
 
 /// Control flags for shutdown sequencing.
@@ -462,6 +469,152 @@ fn choose_config(
 }
 
 // ---------------------------------------------------------------------------
+// Drift detection
+// ---------------------------------------------------------------------------
+
+/// Detects a queue that is *persistently* longer than needed.
+///
+/// Sound servers (PulseAudio, PipeWire, WASAPI shared mode, ...) pull audio
+/// in irregular bursts, so the instantaneous queue level swings by several
+/// periods without anything being wrong. Trimming on peaks would throw away
+/// good audio (audible as crackle / missing syllables). What signals real
+/// excess latency — clock drift between two devices, or a burst that was
+/// never consumed — is the queue's *minimum* staying high. So we track the
+/// lowest level seen over a window (~1 s of audio) and, at the end of the
+/// window, report how much can be dropped while still leaving `floor`
+/// frames at that lowest point (no underrun if the pattern repeats).
+///
+/// Pure arithmetic: safe to use inside an audio callback.
+#[derive(Debug, Clone)]
+struct BacklogWatch {
+    window: usize,
+    floor: usize,
+    tolerance: usize,
+    elapsed: usize,
+    min_level: usize,
+}
+
+impl BacklogWatch {
+    /// `window`: frames of audio per decision; `floor`: frames to keep at the
+    /// lowest point; `tolerance`: excess (above `floor`) ignored to avoid
+    /// chasing tiny drifts with frequent clicks.
+    fn new(window: usize, floor: usize, tolerance: usize) -> Self {
+        Self {
+            window: window.max(1),
+            floor,
+            tolerance,
+            elapsed: 0,
+            min_level: usize::MAX,
+        }
+    }
+
+    /// Record the queue level at its low point and that `advanced` frames of
+    /// audio time passed. Returns the number of frames to drop now (0 = none).
+    fn observe(&mut self, level: usize, advanced: usize) -> usize {
+        self.min_level = self.min_level.min(level);
+        self.elapsed += advanced;
+        if self.elapsed < self.window {
+            return 0;
+        }
+        let min = self.min_level;
+        self.reset();
+        if min > self.floor + self.tolerance {
+            min - self.floor
+        } else {
+            0
+        }
+    }
+
+    fn reset(&mut self) {
+        self.elapsed = 0;
+        self.min_level = usize::MAX;
+    }
+}
+
+/// What the output callback should do this period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputPlan {
+    /// Not primed yet: output silence, consume nothing.
+    Silence,
+    /// Drop `skip` queued frames first (latency correction), then play.
+    Play { skip: usize },
+}
+
+/// Output-queue policy, separated from the CPAL callback so it can be unit
+/// tested with simulated devices (bursty pulls, clock drift).
+///
+/// * Priming: wait until `prime` frames are queued before playing. The worker
+///   delivers audio in RNNoise-sized chunks (`chunk` = 10 ms), so between two
+///   chunks the device consumes up to `chunk` frames on top of the request
+///   being served. `prime = largest request + chunk + floor` therefore leaves
+///   about `floor` frames at the queue's low point, whatever the phase
+///   between producer and device.
+/// * Drift correction: [`BacklogWatch`] over ~1 s windows.
+/// * Hard cap: if the queue ever exceeds `prime + hard_max` (e.g. a device
+///   that stalled for a long time, or two wildly mismatched clocks), trim
+///   back to `prime` immediately so latency can never run away.
+///
+/// Pure arithmetic: RT-safe.
+#[derive(Debug, Clone)]
+struct OutputPacer {
+    prime: usize,
+    chunk: usize,
+    floor: usize,
+    hard_max: usize,
+    primed: bool,
+    watch: BacklogWatch,
+}
+
+impl OutputPacer {
+    /// Priming level for a device requesting `request` frames per callback.
+    fn prime_for(request: usize, q: &OutputQueueParams) -> usize {
+        request + q.chunk + q.floor
+    }
+
+    fn new(period_hint: usize, q: OutputQueueParams) -> Self {
+        Self {
+            prime: Self::prime_for(period_hint, &q),
+            chunk: q.chunk,
+            floor: q.floor,
+            hard_max: q.hard_max,
+            primed: false,
+            watch: BacklogWatch::new(q.window, q.floor, q.tolerance),
+        }
+    }
+
+    /// Decide for a callback that wants `wanted` frames with `available` queued.
+    fn plan(&mut self, available: usize, wanted: usize, draining: bool) -> OutputPlan {
+        self.prime = self.prime.max(wanted + self.chunk + self.floor);
+        if draining {
+            return OutputPlan::Play { skip: 0 };
+        }
+        if !self.primed {
+            if available < self.prime {
+                return OutputPlan::Silence;
+            }
+            self.primed = true;
+            self.watch.reset();
+        }
+        if available > self.prime + self.hard_max {
+            self.watch.reset();
+            return OutputPlan::Play {
+                skip: available - self.prime,
+            };
+        }
+        let low_point = available.saturating_sub(wanted);
+        OutputPlan::Play {
+            skip: self.watch.observe(low_point, wanted),
+        }
+    }
+
+    /// The callback ran out of data: re-prime (one short gap, not crackle).
+    fn on_underrun(&mut self) {
+        self.primed = false;
+        self.watch.reset();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CPAL callbacks (real-time context!)
 // ---------------------------------------------------------------------------
 
@@ -503,6 +656,7 @@ where
             metrics.input_overruns.fetch_add(1, Ordering::Relaxed);
         }
         metrics.in_peak_bits.store(peak.to_bits(), Ordering::Relaxed);
+        metrics.in_cb_max.fetch_max(data.len() / channels, Ordering::Relaxed);
         // Wake the DSP worker. Futex wake = non-blocking for us.
         worker.unpark();
     };
@@ -525,6 +679,7 @@ fn build_output_stream<T>(
     metrics: Arc<Metrics>,
     ctl: Arc<Control>,
     prime_frames: usize,
+    q: OutputQueueParams,
 ) -> Result<Stream>
 where
     T: SizedSample + FromSample<f32> + Send + 'static,
@@ -533,26 +688,32 @@ where
     let silence = T::from_sample(0.0f32);
     let err_metrics = metrics.clone();
 
-    // Priming: stay silent until the worker has queued `prime_frames`. That
-    // backlog is the jitter margin that absorbs the 10 ms burstiness of
-    // RNNoise output versus the much smaller device period. After an underrun
-    // we go back to priming so the margin is rebuilt in one go (one short gap)
-    // instead of crackling continuously.
-    let mut primed = false;
+    // Priming, drift correction and the latency hard cap live in
+    // `OutputPacer` (pure logic, unit-tested with simulated devices).
+    let mut pacer = OutputPacer::new(prime_frames, q);
 
     let data_cb = move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-        let available = cons.occupied_len();
-        metrics.out_fill.store(available, Ordering::Relaxed);
+        let mut available = cons.occupied_len();
+        let wanted = data.len() / channels;
+        metrics.out_cb_max.fetch_max(wanted, Ordering::Relaxed);
 
         let draining = ctl.draining.load(Ordering::Relaxed);
-        if !primed && !draining {
-            if available >= prime_frames {
-                primed = true;
-            } else {
+        match pacer.plan(available, wanted, draining) {
+            OutputPlan::Silence => {
+                metrics.out_fill.store(available, Ordering::Relaxed);
                 data.fill(silence);
                 return;
             }
+            OutputPlan::Play { skip } if skip > 0 => {
+                // Only the consumer can drop from an SPSC ring; `skip` just
+                // advances the read index (wait-free, RT-safe).
+                let skipped = cons.skip(skip);
+                metrics.dropped_samples.fetch_add(skipped as u64, Ordering::Relaxed);
+                available -= skipped;
+            }
+            OutputPlan::Play { .. } => {}
         }
+        metrics.out_fill.store(available, Ordering::Relaxed);
 
         let mut underrun = false;
         let mut peak = 0.0f32;
@@ -581,7 +742,7 @@ where
         metrics.out_peak_bits.store(peak.to_bits(), Ordering::Relaxed);
         if underrun && !draining {
             metrics.output_underruns.fetch_add(1, Ordering::Relaxed);
-            primed = false;
+            pacer.on_underrun();
         }
     };
 
@@ -653,18 +814,19 @@ fn build_output_any(
     metrics: Arc<Metrics>,
     ctl: Arc<Control>,
     prime_frames: usize,
+    q: OutputQueueParams,
 ) -> Result<Stream> {
     macro_rules! build {
         ($cfg:expr, $cons:expr) => {
             match spec.format {
-                SampleFormat::F32 => build_output_stream::<f32>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames),
-                SampleFormat::I16 => build_output_stream::<i16>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames),
-                SampleFormat::U16 => build_output_stream::<u16>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames),
-                SampleFormat::I32 => build_output_stream::<i32>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames),
-                SampleFormat::U32 => build_output_stream::<u32>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames),
-                SampleFormat::F64 => build_output_stream::<f64>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames),
-                SampleFormat::I8 => build_output_stream::<i8>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames),
-                SampleFormat::U8 => build_output_stream::<u8>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames),
+                SampleFormat::F32 => build_output_stream::<f32>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames, q),
+                SampleFormat::I16 => build_output_stream::<i16>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames, q),
+                SampleFormat::U16 => build_output_stream::<u16>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames, q),
+                SampleFormat::I32 => build_output_stream::<i32>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames, q),
+                SampleFormat::U32 => build_output_stream::<u32>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames, q),
+                SampleFormat::F64 => build_output_stream::<f64>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames, q),
+                SampleFormat::I8 => build_output_stream::<i8>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames, q),
+                SampleFormat::U8 => build_output_stream::<u8>(device, $cfg, $cons, metrics.clone(), ctl.clone(), prime_frames, q),
                 other => bail!("unsupported output sample format {other:?}"),
             }
         };
@@ -690,6 +852,21 @@ fn build_output_any(
     build!(&spec.config, c)
 }
 
+/// Drift-correction parameters for the output queue (frames at output rate).
+#[derive(Debug, Clone, Copy)]
+struct OutputQueueParams {
+    /// Size of the producer's chunks (one RNNoise frame at the output rate).
+    chunk: usize,
+    /// Decision window (≈ 1 s of audio).
+    window: usize,
+    /// Frames to keep at the queue's lowest point (jitter margin).
+    floor: usize,
+    /// Excess above `floor` that is tolerated without trimming.
+    tolerance: usize,
+    /// Queue length above `prime` that is trimmed immediately (hard cap).
+    hard_max: usize,
+}
+
 /// Marker error: the fixed-size attempt failed and the ring buffer endpoint
 /// was consumed by the failed closure; the caller must recreate the ring buffer
 /// and call again (the spec has already been downgraded to `BufferSize::Default`).
@@ -711,12 +888,12 @@ struct WorkerParams {
     in_rate: u32,
     out_rate: u32,
     bypass: bool,
-    /// Frames (at `in_rate`) above which the input backlog is trimmed.
+    /// Frames (at `in_rate`) above which the input backlog is trimmed. This
+    /// only fires after a long stall of this thread; normal device drift is
+    /// corrected on the output side.
     in_backlog_limit: usize,
     /// Frames (at `in_rate`) the backlog is trimmed *to*.
     in_backlog_target: usize,
-    /// Frames (at `out_rate`) above which output is considered over-queued.
-    out_backlog_limit: usize,
 }
 
 /// Scale a frame count from one rate to another, rounding up.
@@ -752,7 +929,6 @@ fn worker_loop(
     // Worst-case per-stage output exceeding capacity would only cost one
     // reallocation on the worker thread (never in a CPAL callback).
 
-    let frame_in = scale_frames(FRAME_SIZE, RNNOISE_RATE, p.in_rate);
     let mut idle_wakeups: u64 = 0;
 
     debug!(
@@ -768,22 +944,17 @@ fn worker_loop(
         let in_backlog = in_cons.occupied_len();
         metrics.in_fill.store(in_backlog, Ordering::Relaxed);
 
-        // --- Latency clamp -------------------------------------------------
-        // Clock drift between two different devices, or a long scheduler
-        // stall, lets the backlog grow without bound; that would silently
-        // turn into ever-increasing latency. Trim the oldest input instead.
-        // Costs one audible click, bounds the worst case.
-        if !stopping {
-            if in_backlog > p.in_backlog_limit {
-                let drop = in_backlog - p.in_backlog_target;
-                let skipped = in_cons.skip(drop);
-                metrics.dropped_samples.fetch_add(skipped as u64, Ordering::Relaxed);
-                debug!("latency clamp: dropped {skipped} input frames (backlog {in_backlog})");
-            } else if out_prod.occupied_len() > p.out_backlog_limit && in_backlog >= frame_in {
-                let skipped = in_cons.skip(frame_in);
-                metrics.dropped_samples.fetch_add(skipped as u64, Ordering::Relaxed);
-                debug!("latency clamp: output over-queued, dropped {skipped} input frames");
-            }
+        // --- Stall recovery ------------------------------------------------
+        // If this thread was descheduled for a long time (system under heavy
+        // load, laptop resumed from sleep) the input ring holds a large
+        // backlog; playing it all would add that much latency permanently.
+        // Drop the oldest audio instead (one click, latency stays bounded).
+        // Ordinary drift / bursty devices are handled by the output callback.
+        if !stopping && in_backlog > p.in_backlog_limit {
+            let drop = in_backlog - p.in_backlog_target;
+            let skipped = in_cons.skip(drop);
+            metrics.dropped_samples.fetch_add(skipped as u64, Ordering::Relaxed);
+            debug!("stall recovery: dropped {skipped} input frames (backlog {in_backlog})");
         }
 
         let n = in_cons.pop_slice(&mut scratch);
@@ -873,7 +1044,8 @@ fn ms(frames: usize, rate: u32) -> f64 {
 pub struct LatencyBudget {
     pub input_period_ms: f64,
     pub rnnoise_frame_ms: f64,
-    /// max(input period, RNNoise frame): the two overlap.
+    /// Input period + RNNoise framing (framing is counted once for the
+    /// whole chain; see `latency_budget`).
     pub input_side_ms: f64,
     pub resample_in_ms: f64,
     pub resample_out_ms: f64,
@@ -1006,9 +1178,20 @@ impl Drop for Engine {
 
 /// Convenience for the CLI: run until `running` is cleared, logging stats.
 pub fn run(cfg: EngineConfig, running: Arc<AtomicBool>) -> Result<()> {
+    run_with(cfg, running, |_| Ok(()))
+}
+
+/// Like [`run`], but calls `on_started` once the streams are playing (used to
+/// route the output into a virtual microphone). An error stops the engine.
+pub fn run_with(
+    cfg: EngineConfig,
+    running: Arc<AtomicBool>,
+    on_started: impl FnOnce(&Engine) -> Result<()>,
+) -> Result<()> {
     let stats_secs = cfg.stats_secs;
     let engine = Engine::start(cfg)?;
     log_info(engine.info());
+    on_started(&engine)?;
     info!("running — press Ctrl+C to stop");
 
     let stats_every = (stats_secs > 0).then(|| Duration::from_secs(stats_secs));
@@ -1132,23 +1315,31 @@ fn start_pipeline(cfg: &EngineConfig, metrics: Arc<Metrics>) -> Result<Started> 
         let frame_out = scale_frames(FRAME_SIZE, RNNOISE_RATE, out_rate);
         let frame_in = scale_frames(FRAME_SIZE, RNNOISE_RATE, in_rate);
 
-        // Output priming threshold = one device period + half an RNNoise frame.
-        // The worker emits 480-frame bursts every 10 ms while the output
-        // callback drains `out_period` every period; the half-frame margin
-        // covers worker scheduling jitter of up to 5 ms without underrunning.
-        let prime = out_period + frame_out / 2;
+        // Output queue policy (see `OutputPacer` / `BacklogWatch`):
+        //  * floor: aim for ~5 ms (half an RNNoise frame) at the queue's low
+        //    point — the jitter margin for worker scheduling;
+        //  * drift: if over ~1 s the low point stays > 10 ms above the floor,
+        //    drop the excess in one step;
+        //  * hard cap: latency can never exceed prime + 250 ms.
+        let out_q = OutputQueueParams {
+            chunk: frame_out,
+            window: out_rate as usize,
+            floor: frame_out / 2,
+            tolerance: frame_out,
+            hard_max: out_rate as usize / 4,
+        };
+        // Output priming threshold: one device period + one RNNoise chunk +
+        // the jitter margin.
+        let prime = OutputPacer::prime_for(out_period, &out_q);
 
         let params = WorkerParams {
             in_rate,
             out_rate,
             bypass: cfg.bypass,
-            // Never let more than ~4 RNNoise frames (40 ms) queue up on input...
-            in_backlog_limit: 4 * frame_in + in_period,
-            // ...and when trimming, leave exactly one frame so processing can continue.
+            // Stall recovery: more than 250 ms (plus one input chunk) waiting
+            // means this thread was not scheduled; keep one frame and go on.
+            in_backlog_limit: in_rate as usize / 4 + in_period,
             in_backlog_target: frame_in,
-            // Output queue should hover around `prime`; beyond prime + 2 frames
-            // we are accumulating drift and start dropping input.
-            out_backlog_limit: prime + 2 * frame_out,
         };
 
         let worker_ctl = ctl.clone();
@@ -1185,6 +1376,7 @@ fn start_pipeline(cfg: &EngineConfig, metrics: Arc<Metrics>) -> Result<Started> 
             metrics.clone(),
             ctl.clone(),
             prime,
+            out_q,
         );
         let out_stream = match out_result {
             Ok(s) => s,
@@ -1249,10 +1441,11 @@ fn latency_budget(in_spec: &StreamSpec, out_spec: &StreamSpec, prime: usize) -> 
         .buffer_frames
         .map(|n| ms(n as usize, in_rate))
         .unwrap_or(10.0);
-    let output_period_ms = out_spec
+    let out_period_frames = out_spec
         .buffer_frames
-        .map(|n| ms(n as usize, out_rate))
-        .unwrap_or(10.0);
+        .map(|n| n as usize)
+        .unwrap_or_else(|| scale_frames(480, RNNOISE_RATE, out_rate));
+    let output_period_ms = ms(out_period_frames, out_rate);
     let rnnoise_frame_ms = ms(FRAME_SIZE, RNNOISE_RATE);
     let resample_in_ms = StreamResampler::new(in_rate, RNNOISE_RATE)
         .map(|r| r.latency_ms())
@@ -1260,12 +1453,20 @@ fn latency_budget(in_spec: &StreamSpec, out_spec: &StreamSpec, prime: usize) -> 
     let resample_out_ms = StreamResampler::new(RNNOISE_RATE, out_rate)
         .map(|r| r.latency_ms())
         .unwrap_or(0.0);
-    let output_queue_ms = ms(prime, out_rate);
 
-    // Input period and RNNoise framing overlap: a sample waits until its
-    // 480-frame block is complete, which already includes waiting for the
-    // input period that delivers it. So the input side costs max(period, frame).
-    let input_side_ms = input_period_ms.max(rnnoise_frame_ms);
+    // Latency model, per sample:
+    //  * input side: up to one input period until the callback delivers it,
+    //    plus RNNoise framing. A sample at position x of a 480-sample frame
+    //    waits (480 - x) for the frame to complete and then x more while the
+    //    chunk drains on the output — together exactly one frame (10 ms) for
+    //    every sample, so framing is counted once, here.
+    //  * output queue: what is still queued in front of the chunk when it
+    //    arrives — the low point the pacer steers to (floor = half a frame),
+    //    which can sit up to one device period above it depending on phase.
+    //  * output period: the device's own buffer.
+    let input_side_ms = input_period_ms + rnnoise_frame_ms;
+    let floor = scale_frames(FRAME_SIZE, RNNOISE_RATE, out_rate) / 2;
+    let output_queue_ms = ms(floor + out_period_frames, out_rate);
     let total_ms =
         input_side_ms + resample_in_ms + resample_out_ms + output_queue_ms + output_period_ms;
 
@@ -1304,15 +1505,15 @@ fn log_info(info: &EngineInfo) {
         period(info.output_period, info.output_rate)
     );
     let l = &info.latency;
-    info!("latency budget (mic -> output, worst case, excluding driver/hardware):");
+    info!("latency budget (mic -> output, typical worst case, excluding driver/hardware):");
     info!(
-        "  input period + RNNoise framing : {:>6.2} ms  (max of {:.2} ms, {:.2} ms)",
+        "  input period + RNNoise framing : {:>6.2} ms  ({:.2} + {:.2} ms)",
         l.input_side_ms, l.input_period_ms, l.rnnoise_frame_ms
     );
     info!("  resampler in  ({} -> 48000)    : {:>6.2} ms", info.input_rate, l.resample_in_ms);
     info!("  resampler out (48000 -> {})    : {:>6.2} ms", info.output_rate, l.resample_out_ms);
     info!(
-        "  output queue (priming level)   : {:>6.2} ms  ({} frames)",
+        "  output queue (steady state)    : {:>6.2} ms  (primes at {} frames)",
         l.output_queue_ms, l.output_queue_frames
     );
     info!("  output period                  : {:>6.2} ms", l.output_period_ms);
@@ -1339,16 +1540,20 @@ fn snapshot(m: &Metrics, in_rate: u32, out_rate: u32) -> MetricsSnapshot {
         output_overruns: m.output_overruns.load(Ordering::Relaxed),
         dropped_samples: m.dropped_samples.load(Ordering::Relaxed),
         stream_errors: m.stream_errors.load(Ordering::Relaxed),
+        in_cb_max: m.in_cb_max.load(Ordering::Relaxed),
+        out_cb_max: m.out_cb_max.load(Ordering::Relaxed),
     }
 }
 
 fn log_stats(s: &MetricsSnapshot) {
     info!(
-        "stats: frames={} vad={:.2} in_q={:.1}ms out_q={:.1}ms | in_overrun={} out_underrun={} out_overrun={} dropped={} errors={}",
+        "stats: frames={} vad={:.2} in_q={:.1}ms out_q={:.1}ms cb_max={}/{} | in_overrun={} out_underrun={} out_overrun={} dropped={} errors={}",
         s.frames_processed,
         s.vad,
         s.in_fill_ms,
         s.out_fill_ms,
+        s.in_cb_max,
+        s.out_cb_max,
         s.input_overruns,
         s.output_underruns,
         s.output_overruns,
@@ -1367,6 +1572,141 @@ mod tests {
         assert_eq!(scale_frames(480, 48_000, 96_000), 960);
         assert_eq!(scale_frames(480, 48_000, 48_000), 480);
         assert_eq!(scale_frames(1, 48_000, 44_100), 1);
+    }
+
+    #[test]
+    fn backlog_watch_ignores_bursty_consumer() {
+        // Consumer pulls 4 x 512 frames every ~43 ms: queue swings 0..2048
+        // but its minimum stays ~0 -> never trim.
+        let mut w = BacklogWatch::new(48_000, 240, 480);
+        let mut dropped = 0;
+        for i in 0..2000 {
+            let level = if i % 4 == 3 { 0 } else { 2048 - (i % 4) * 512 };
+            dropped += w.observe(level, 512);
+        }
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn backlog_watch_trims_persistent_excess_to_floor() {
+        let mut w = BacklogWatch::new(48_000, 240, 480);
+        let mut total = 0;
+        // Queue never drops below 3000 for a full window.
+        for _ in 0..(48_000 / 128) {
+            total += w.observe(3000 + 37, 128);
+        }
+        assert_eq!(total, 3037 - 240);
+    }
+
+    #[test]
+    fn backlog_watch_tolerates_small_excess() {
+        let mut w = BacklogWatch::new(48_000, 240, 480);
+        let mut total = 0;
+        for _ in 0..1000 {
+            total += w.observe(600, 128);
+        }
+        assert_eq!(total, 0);
+    }
+
+    /// Simulate `seconds` of a producer emitting 480-frame RNNoise bursts at
+    /// `48 kHz * (1 + drift)` and a device pulling `burst` x `period` frames
+    /// at a time at exactly 48 kHz. Returns (max queue, underruns, dropped,
+    /// final queue), all in frames.
+    fn simulate(drift: f64, period: usize, burst: usize, seconds: f64) -> (usize, usize, usize, usize) {
+        let rate = 48_000.0;
+        let frame = 480usize;
+        let q = OutputQueueParams {
+            chunk: frame,
+            window: 48_000,
+            floor: frame / 2,
+            tolerance: frame,
+            hard_max: 12_000,
+        };
+        let mut pacer = OutputPacer::new(period, q);
+        let (mut queue, mut max_q, mut underruns, mut dropped) = (0usize, 0usize, 0usize, 0usize);
+        let prod_dt = frame as f64 / (rate * (1.0 + drift));
+        let cons_dt = (period * burst) as f64 / rate;
+        let (mut t_prod, mut t_cons) = (0.0f64, cons_dt);
+        while t_cons < seconds {
+            // Producer events up to the next consumer wake-up.
+            while t_prod <= t_cons {
+                queue += frame;
+                t_prod += prod_dt;
+            }
+            max_q = max_q.max(queue);
+            // Sound server wakes and pulls `burst` periods back to back.
+            for _ in 0..burst {
+                match pacer.plan(queue, period, false) {
+                    OutputPlan::Silence => {}
+                    OutputPlan::Play { skip } => {
+                        queue -= skip;
+                        dropped += skip;
+                        if queue < period {
+                            queue = 0;
+                            underruns += 1;
+                            pacer.on_underrun();
+                        } else {
+                            queue -= period;
+                        }
+                    }
+                }
+            }
+            t_cons += cons_dt;
+        }
+        eprintln!(
+            "simulate drift={drift:+} period={period}x{burst} {seconds}s: max_q={max_q} underruns={underruns} dropped={dropped} final_q={queue}"
+        );
+        (max_q, underruns, dropped, queue)
+    }
+
+    #[test]
+    fn pacer_bursty_device_no_drift_is_glitch_free() {
+        // PipeWire-like: 4 x 256 frames every ~21 ms, perfect clocks, 60 s.
+        let (max_q, underruns, dropped, _) = simulate(0.0, 256, 4, 60.0);
+        assert_eq!(underruns, 0, "underruns");
+        assert_eq!(dropped, 0, "nothing should be dropped without drift");
+        assert!(max_q <= 256 * 4 + 480 + 240 + 2 * 480, "max queue {max_q}");
+    }
+
+    #[test]
+    fn pacer_fast_input_clock_keeps_latency_bounded() {
+        // Mic clock 0.1 % fast vs. output (≈ 48 extra frames/s), 120 s.
+        let (max_q, underruns, dropped, final_q) = simulate(0.001, 128, 1, 120.0);
+        assert_eq!(underruns, 0);
+        assert!(dropped > 0, "excess must be trimmed");
+        // Without correction the queue would end ~5760 frames (120 ms) long.
+        assert!(final_q <= 128 + 480 + 240 + 2 * 480, "final queue {final_q}");
+        assert!(max_q <= 128 + 480 + 240 + 3 * 480, "max queue {max_q}");
+    }
+
+    #[test]
+    fn pacer_slow_input_clock_rarely_reprimes() {
+        // Mic clock 0.1 % slow (48 frames/s deficit): the queue slowly
+        // empties. The ~240-frame margin lasts ~5 s, so a short re-prime gap
+        // every few seconds is unavoidable — but never continuous crackle.
+        let (_, underruns, dropped, _) = simulate(-0.001, 128, 1, 60.0);
+        assert_eq!(dropped, 0);
+        assert!(underruns <= 15, "underruns {underruns}");
+    }
+
+    #[test]
+    fn pacer_hard_cap_bounds_wild_mismatch() {
+        // Producer 30 % faster than the device (broken clocks): latency must
+        // stay under prime + hard cap instead of filling the ring.
+        let (max_q, _, dropped, final_q) = simulate(0.30, 128, 1, 20.0);
+        assert!(dropped > 0);
+        let prime = 128 + 480 + 240;
+        assert!(final_q <= prime + 12_000 + 480, "final queue {final_q}");
+        assert!(max_q <= prime + 12_000 + 2 * 480, "max queue {max_q}");
+    }
+
+    #[test]
+    fn pacer_large_requests_raise_prime() {
+        let q = OutputQueueParams { chunk: 480, window: 48_000, floor: 240, tolerance: 480, hard_max: 12_000 };
+        let mut p = OutputPacer::new(128, q);
+        // Device asks for 4800 frames at once; 1000 queued must not start playback.
+        assert_eq!(p.plan(1000, 4800, false), OutputPlan::Silence);
+        assert_eq!(p.plan(4800 + 480 + 240, 4800, false), OutputPlan::Play { skip: 0 });
     }
 
     #[test]

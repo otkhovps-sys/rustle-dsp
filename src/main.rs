@@ -11,6 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
+use crisp_rs::virtual_mic::VirtualMic;
 use crisp_rs::{audio_engine, EngineConfig};
 
 #[derive(Parser, Debug)]
@@ -44,8 +45,14 @@ struct RunArgs {
     input: Option<String>,
 
     /// Output device (speakers or a virtual cable): index, name substring, or default.
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with = "virtual_mic")]
     output: Option<String>,
+
+    /// Send the denoised audio to a virtual microphone that chat apps
+    /// (Discord, Zoom, Meet, OBS...) can select. Linux: created automatically
+    /// via PulseAudio/PipeWire. Windows/macOS: uses VB-Cable / BlackHole.
+    #[arg(long)]
+    virtual_mic: bool,
 
     /// Hardware period size in frames for both streams (0 = backend default).
     /// 128 frames @ 48 kHz = 2.67 ms per direction.
@@ -85,6 +92,7 @@ impl RunArgs {
         Self {
             input: None,
             output: None,
+            virtual_mic: false,
             buffer_frames: 128,
             rate: None,
             bypass: false,
@@ -116,7 +124,7 @@ fn run(args: RunArgs) -> Result<()> {
         .context("installing Ctrl+C handler")?;
     }
 
-    let cfg = EngineConfig {
+    let mut cfg = EngineConfig {
         input: args.input,
         output: args.output,
         buffer_frames: args.buffer_frames,
@@ -125,5 +133,29 @@ fn run(args: RunArgs) -> Result<()> {
         stats_secs: args.stats_secs,
     };
 
-    audio_engine::run(cfg, running)
+    if !args.virtual_mic {
+        return audio_engine::run(cfg, running);
+    }
+
+    // Virtual-mic mode: the VirtualMic must outlive the engine (dropping it
+    // removes the Linux virtual device), so it is created first.
+    let catalog = crisp_rs::device_catalog();
+    let vmic = VirtualMic::prepare(&catalog.outputs)?;
+    let input_name = match cfg.input.as_deref() {
+        Some(sel) => sel.to_string(),
+        None => "default".to_string(),
+    };
+    vmic.check_input(&input_name)?;
+    cfg.output = Some(vmic.output_selector().to_string());
+    log::info!("virtual mic via {}", vmic.backend());
+
+    audio_engine::run_with(cfg, running, |engine| {
+        vmic.check_input(&engine.info().input_name)?;
+        vmic.route_engine_output()?;
+        log::info!(
+            "==> In Discord / Zoom / Meet select the microphone: \"{}\"",
+            vmic.mic_name()
+        );
+        Ok(())
+    })
 }
