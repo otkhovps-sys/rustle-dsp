@@ -8,8 +8,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use crisp_rs::resampler::{StreamResampler, RNNOISE_RATE};
+use crisp_rs::voice::{GateMode, Preset, VoiceSettings};
 
 use crisp_rs::virtual_mic::VirtualMic;
 use crisp_rs::{audio_engine, EngineConfig};
@@ -36,6 +40,96 @@ enum Command {
     List,
     /// Capture, denoise and play back (default command).
     Run(RunArgs),
+    /// Denoise a WAV file offline with exactly the same processing chain.
+    /// Output: 48 kHz mono 16-bit WAV.
+    Process {
+        /// Input WAV (any rate / channel count / sample format).
+        input: PathBuf,
+        /// Output WAV path.
+        output: PathBuf,
+        #[command(flatten)]
+        voice: VoiceArgs,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PresetArg {
+    /// Natural voice: 80 % strength + light voice gate (quiet rooms).
+    Light,
+    /// Full RNNoise + light voice gate (recommended).
+    Balanced,
+    /// Full RNNoise + strong voice gate (noisy rooms).
+    Strong,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum GateArg {
+    Off,
+    Light,
+    Strong,
+}
+
+/// Voice-processing options shared by `run` and `process`.
+#[derive(Args, Debug, Clone)]
+struct VoiceArgs {
+    /// Processing preset; the options below override parts of it.
+    #[arg(long, value_enum, default_value_t = PresetArg::Balanced)]
+    preset: PresetArg,
+
+    /// Noise-reduction strength in percent (0 = raw mic, 100 = full RNNoise).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
+    strength: Option<u8>,
+
+    /// Voice gate between phrases: off, light (-15 dB) or strong (-45 dB).
+    #[arg(long, value_enum)]
+    gate: Option<GateArg>,
+
+    /// Disable automatic gain control (speech level normalisation).
+    #[arg(long)]
+    no_agc: bool,
+
+    /// Disable the 80 Hz high-pass (rumble) filter.
+    #[arg(long)]
+    no_highpass: bool,
+
+    /// Pass the raw microphone through (A/B comparison, same latency).
+    #[arg(long)]
+    bypass: bool,
+}
+
+impl VoiceArgs {
+    fn settings(&self) -> VoiceSettings {
+        let mut s = VoiceSettings::preset(match self.preset {
+            PresetArg::Light => Preset::Light,
+            PresetArg::Balanced => Preset::Balanced,
+            PresetArg::Strong => Preset::Strong,
+        });
+        if let Some(p) = self.strength {
+            s.strength = f32::from(p) / 100.0;
+        }
+        if let Some(g) = self.gate {
+            s.gate = match g {
+                GateArg::Off => GateMode::Off,
+                GateArg::Light => GateMode::Light,
+                GateArg::Strong => GateMode::Strong,
+            };
+        }
+        s.agc &= !self.no_agc;
+        s.highpass &= !self.no_highpass;
+        s.bypass = self.bypass;
+        s
+    }
+
+    fn defaults() -> Self {
+        Self {
+            preset: PresetArg::Balanced,
+            strength: None,
+            gate: None,
+            no_agc: false,
+            no_highpass: false,
+            bypass: false,
+        }
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -64,9 +158,8 @@ struct RunArgs {
     #[arg(long)]
     rate: Option<u32>,
 
-    /// Bypass RNNoise (A/B comparison). Latency path is identical.
-    #[arg(long)]
-    bypass: bool,
+    #[command(flatten)]
+    voice: VoiceArgs,
 
     /// Print pipeline statistics every N seconds (0 = off).
     #[arg(long, default_value_t = 5)]
@@ -84,7 +177,71 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Run(RunArgs::default_args())) {
         Command::List => audio_engine::list_devices(),
         Command::Run(args) => run(args),
+        Command::Process {
+            input,
+            output,
+            voice,
+        } => process_file(&input, &output, &voice.settings()),
     }
+}
+
+/// Offline: WAV in → mono → 48 kHz → voice chain → 48 kHz mono 16-bit WAV.
+fn process_file(input: &Path, output: &Path, s: &VoiceSettings) -> Result<()> {
+    let mut reader = hound::WavReader::open(input)
+        .with_context(|| format!("opening {}", input.display()))?;
+    let spec = reader.spec();
+    let channels = usize::from(spec.channels.max(1));
+    let interleaved: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<_, _>>()?,
+        hound::SampleFormat::Int => {
+            let scale = 1.0 / (1u64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|v| v.map(|x| x as f32 * scale))
+                .collect::<Result<_, _>>()?
+        }
+    };
+    let mono: Vec<f32> = interleaved
+        .chunks_exact(channels)
+        .map(|f| f.iter().sum::<f32>() / channels as f32)
+        .collect();
+
+    let mut at48 = Vec::with_capacity(mono.len() * 48_000 / spec.sample_rate as usize + 1024);
+    let mut rs = StreamResampler::new(spec.sample_rate, RNNOISE_RATE)?;
+    for chunk in mono.chunks(4096) {
+        rs.process(chunk, &mut |x| at48.extend_from_slice(x))?;
+    }
+    rs.flush(&mut |x| at48.extend_from_slice(x))?;
+
+    let started = std::time::Instant::now();
+    let out = crisp_rs::voice::process_buffer(&at48, s);
+    let elapsed = started.elapsed().as_secs_f64();
+
+    let mut writer = hound::WavWriter::create(
+        output,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: RNNOISE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .with_context(|| format!("creating {}", output.display()))?;
+    for v in &out {
+        writer.write_sample((v.clamp(-1.0, 1.0) * 32767.0).round() as i16)?;
+    }
+    writer.finalize()?;
+
+    let audio_secs = out.len() as f64 / f64::from(RNNOISE_RATE);
+    log::info!(
+        "{} → {}: {:.1} s of audio processed in {:.2} s ({:.0}× real time)",
+        input.display(),
+        output.display(),
+        audio_secs,
+        elapsed,
+        audio_secs / elapsed.max(1e-9)
+    );
+    Ok(())
 }
 
 impl RunArgs {
@@ -95,7 +252,7 @@ impl RunArgs {
             virtual_mic: false,
             buffer_frames: 128,
             rate: None,
-            bypass: false,
+            voice: VoiceArgs::defaults(),
             stats_secs: 5,
         }
     }
@@ -129,7 +286,7 @@ fn run(args: RunArgs) -> Result<()> {
         output: args.output,
         buffer_frames: args.buffer_frames,
         force_rate: args.rate,
-        bypass: args.bypass,
+        voice: args.voice.settings(),
         stats_secs: args.stats_secs,
     };
 

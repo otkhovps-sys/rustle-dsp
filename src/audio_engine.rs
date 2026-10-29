@@ -37,7 +37,8 @@ use log::{debug, error, info, warn};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
-use crate::denoiser::{Denoiser, FRAME_SIZE};
+use crate::denoiser::{FRAME_SIZE, MODEL_DELAY};
+use crate::voice::{VoiceControls, VoiceProcessor, VoiceSettings};
 use crate::resampler::{StreamResampler, RNNOISE_RATE};
 
 // ---------------------------------------------------------------------------
@@ -54,8 +55,9 @@ pub struct EngineConfig {
     pub buffer_frames: u32,
     /// Force a specific device sample rate (useful to exercise the resampler).
     pub force_rate: Option<u32>,
-    /// Bypass RNNoise (A/B testing); the rest of the pipeline is unchanged.
-    pub bypass: bool,
+    /// Voice processing (preset / strength / gate / AGC / bypass). Can be
+    /// changed while running via [`Engine::set_voice`].
+    pub voice: VoiceSettings,
     /// Print runtime statistics every N seconds (0 = never).
     pub stats_secs: u64,
 }
@@ -90,6 +92,9 @@ pub struct Metrics {
     /// bigger and irregular chunks than the requested period.
     pub in_cb_max: AtomicUsize,
     pub out_cb_max: AtomicUsize,
+    /// Voice-gate gain (0..1) and AGC gain (dB) of the last frame (f32 bits).
+    pub gate_gain_bits: AtomicU32,
+    pub agc_gain_db_bits: AtomicU32,
 }
 
 impl Metrics {
@@ -120,6 +125,8 @@ pub struct MetricsSnapshot {
     pub stream_errors: u64,
     pub in_cb_max: usize,
     pub out_cb_max: usize,
+    pub gate_gain: f32,
+    pub agc_gain_db: f32,
 }
 
 /// Control flags for shutdown sequencing.
@@ -887,7 +894,7 @@ impl std::error::Error for RetryWithDefault {}
 struct WorkerParams {
     in_rate: u32,
     out_rate: u32,
-    bypass: bool,
+    voice: Arc<VoiceControls>,
     /// Frames (at `in_rate`) above which the input backlog is trimmed. This
     /// only fires after a long stall of this thread; normal device drift is
     /// corrected on the output side.
@@ -911,8 +918,6 @@ fn worker_loop(
     // Everything below is allocated once, before the loop.
     let mut to48 = StreamResampler::new(p.in_rate, RNNOISE_RATE)?;
     let mut from48 = StreamResampler::new(RNNOISE_RATE, p.out_rate)?;
-    let mut denoiser = Denoiser::new(p.bypass);
-
     // Pull at most this many frames per iteration. Slightly more than one
     // RNNoise frame at the highest plausible device rate, so one wake-up is
     // normally enough to complete a frame.
@@ -923,6 +928,8 @@ fn worker_loop(
     // resampler chunk and a full RNNoise frame) so `extend_from_slice` never
     // reallocates in steady state.
     let mut stage48: Vec<f32> = Vec::with_capacity(PULL_FRAMES * 4 + 2 * FRAME_SIZE);
+    // High-pass → RNNoise → strength / gate / AGC / limiter (see `voice`).
+    let mut voice = VoiceProcessor::new(stage48.capacity());
     let mut clean48: Vec<f32> = Vec::with_capacity(stage48.capacity() + FRAME_SIZE);
     let mut outdev: Vec<f32> = Vec::with_capacity(clean48.capacity() * 4);
 
@@ -974,9 +981,12 @@ fn worker_loop(
         stage48.clear();
         to48.process(&scratch[..n], &mut |x| stage48.extend_from_slice(x))?;
 
-        // --- Stage 2: RNNoise on 480-sample frames -----------------------
+        // --- Stage 2: voice processing on 480-sample frames ---------------
+        // Settings are re-read every iteration (relaxed atomics), so UI
+        // changes apply within ~10 ms without any lock.
+        let settings = p.voice.get();
         clean48.clear();
-        denoiser.push(&stage48, &mut |f| clean48.extend_from_slice(f));
+        voice.process(&stage48, &settings, &mut |f| clean48.extend_from_slice(f));
 
         // --- Stage 3: 48 kHz -> output device rate -----------------------
         outdev.clear();
@@ -986,27 +996,34 @@ fn worker_loop(
 
         metrics
             .vad_bits
-            .store(denoiser.last_vad().to_bits(), Ordering::Relaxed);
+            .store(voice.last_vad().to_bits(), Ordering::Relaxed);
         metrics
             .frames_processed
-            .store(denoiser.frames_processed(), Ordering::Relaxed);
+            .store(voice.frames_processed(), Ordering::Relaxed);
+        metrics
+            .gate_gain_bits
+            .store(voice.gate_gain().to_bits(), Ordering::Relaxed);
+        metrics
+            .agc_gain_db_bits
+            .store(voice.agc_gain_db().to_bits(), Ordering::Relaxed);
     }
 
     // --- Shutdown flush: push everything still held in the three stages ----
     stage48.clear();
     to48.flush(&mut |x| stage48.extend_from_slice(x))?;
+    let settings = p.voice.get();
     clean48.clear();
-    denoiser.push(&stage48, &mut |f| clean48.extend_from_slice(f));
-    denoiser.flush(&mut |f| clean48.extend_from_slice(f));
+    voice.process(&stage48, &settings, &mut |f| clean48.extend_from_slice(f));
+    voice.flush(&settings, &mut |f| clean48.extend_from_slice(f));
     outdev.clear();
     from48.process(&clean48, &mut |y| outdev.extend_from_slice(y))?;
     from48.flush(&mut |y| outdev.extend_from_slice(y))?;
     push_out(&mut out_prod, &outdev, &metrics);
 
-    debug_assert_eq!(denoiser.pending(), 0, "flush must leave no partial frame");
+    debug_assert_eq!(voice.pending(), 0, "flush must leave no partial frame");
     debug!(
         "worker exiting: {} frames denoised, {} idle wake-ups",
-        denoiser.frames_processed(),
+        voice.frames_processed(),
         idle_wakeups
     );
     ctl.drained.store(true, Ordering::Release);
@@ -1044,8 +1061,8 @@ fn ms(frames: usize, rate: u32) -> f64 {
 pub struct LatencyBudget {
     pub input_period_ms: f64,
     pub rnnoise_frame_ms: f64,
-    /// Input period + RNNoise framing (framing is counted once for the
-    /// whole chain; see `latency_budget`).
+    /// Input period + RNNoise (10 ms framing + 10 ms model delay, counted
+    /// once for the whole chain; see `latency_budget`).
     pub input_side_ms: f64,
     pub resample_in_ms: f64,
     pub resample_out_ms: f64,
@@ -1069,7 +1086,6 @@ pub struct EngineInfo {
     pub output_format: String,
     pub input_period: Option<u32>,
     pub output_period: Option<u32>,
-    pub bypass: bool,
     pub latency: LatencyBudget,
 }
 
@@ -1082,6 +1098,7 @@ pub struct EngineInfo {
 pub struct Engine {
     info: EngineInfo,
     metrics: Arc<Metrics>,
+    voice: Arc<VoiceControls>,
     stop_flag: Arc<AtomicBool>,
     control: Option<JoinHandle<Result<()>>>,
 }
@@ -1095,20 +1112,24 @@ impl Engine {
     /// Open the devices, start the worker and both streams.
     pub fn start(cfg: EngineConfig) -> Result<Engine> {
         let metrics = Arc::new(Metrics::default());
+        metrics.gate_gain_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
+        let voice = Arc::new(VoiceControls::new(cfg.voice));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel::<ControlMsg>();
 
         let thread_metrics = metrics.clone();
+        let thread_voice = voice.clone();
         let thread_stop = stop_flag.clone();
         let control = thread::Builder::new()
             .name("crisp-control".into())
-            .spawn(move || control_thread(cfg, thread_metrics, thread_stop, tx))
+            .spawn(move || control_thread(cfg, thread_metrics, thread_voice, thread_stop, tx))
             .context("spawning control thread")?;
 
         match rx.recv() {
             Ok(ControlMsg::Ready(info)) => Ok(Engine {
                 info: *info,
                 metrics,
+                voice,
                 stop_flag,
                 control: Some(control),
             }),
@@ -1133,6 +1154,16 @@ impl Engine {
 
     pub fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
+    }
+
+    /// Change the voice processing while running (lock-free, applies within
+    /// one 10 ms frame).
+    pub fn set_voice(&self, s: VoiceSettings) {
+        self.voice.set(s);
+    }
+
+    pub fn voice(&self) -> VoiceSettings {
+        self.voice.get()
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -1218,10 +1249,11 @@ pub fn run_with(
 fn control_thread(
     cfg: EngineConfig,
     metrics: Arc<Metrics>,
+    voice: Arc<VoiceControls>,
     stop_flag: Arc<AtomicBool>,
     tx: std::sync::mpsc::Sender<ControlMsg>,
 ) -> Result<()> {
-    let started = match start_pipeline(&cfg, metrics.clone()) {
+    let started = match start_pipeline(&cfg, metrics.clone(), voice) {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("{e:#}");
@@ -1276,7 +1308,11 @@ struct Started {
     info: EngineInfo,
 }
 
-fn start_pipeline(cfg: &EngineConfig, metrics: Arc<Metrics>) -> Result<Started> {
+fn start_pipeline(
+    cfg: &EngineConfig,
+    metrics: Arc<Metrics>,
+    voice: Arc<VoiceControls>,
+) -> Result<Started> {
     let host = cpal::default_host();
     info!("audio host: {:?}", host.id());
 
@@ -1335,7 +1371,7 @@ fn start_pipeline(cfg: &EngineConfig, metrics: Arc<Metrics>) -> Result<Started> 
         let params = WorkerParams {
             in_rate,
             out_rate,
-            bypass: cfg.bypass,
+            voice: voice.clone(),
             // Stall recovery: more than 250 ms (plus one input chunk) waiting
             // means this thread was not scheduled; keep one frame and go on.
             in_backlog_limit: in_rate as usize / 4 + in_period,
@@ -1408,7 +1444,6 @@ fn start_pipeline(cfg: &EngineConfig, metrics: Arc<Metrics>) -> Result<Started> 
         output_format: format!("{:?}", out_spec.format),
         input_period: in_spec.buffer_frames,
         output_period: out_spec.buffer_frames,
-        bypass: cfg.bypass,
         latency,
     };
 
@@ -1446,7 +1481,9 @@ fn latency_budget(in_spec: &StreamSpec, out_spec: &StreamSpec, prime: usize) -> 
         .map(|n| n as usize)
         .unwrap_or_else(|| scale_frames(480, RNNOISE_RATE, out_rate));
     let output_period_ms = ms(out_period_frames, out_rate);
-    let rnnoise_frame_ms = ms(FRAME_SIZE, RNNOISE_RATE);
+    // RNNoise: 10 ms framing + 10 ms model delay (overlap-add of its 20 ms
+    // window, measured as exactly MODEL_DELAY samples).
+    let rnnoise_frame_ms = ms(FRAME_SIZE + MODEL_DELAY, RNNOISE_RATE);
     let resample_in_ms = StreamResampler::new(in_rate, RNNOISE_RATE)
         .map(|r| r.latency_ms())
         .unwrap_or(0.0);
@@ -1456,10 +1493,11 @@ fn latency_budget(in_spec: &StreamSpec, out_spec: &StreamSpec, prime: usize) -> 
 
     // Latency model, per sample:
     //  * input side: up to one input period until the callback delivers it,
-    //    plus RNNoise framing. A sample at position x of a 480-sample frame
+    //    plus RNNoise. Framing: a sample at position x of a 480-sample frame
     //    waits (480 - x) for the frame to complete and then x more while the
-    //    chunk drains on the output — together exactly one frame (10 ms) for
-    //    every sample, so framing is counted once, here.
+    //    chunk drains on the output — exactly one frame (10 ms) for every
+    //    sample. On top of that the network's output lags its input by one
+    //    more frame (overlap-add). Total RNNoise: 20 ms, counted once, here.
     //  * output queue: what is still queued in front of the chunk when it
     //    arrives — the low point the pacer steers to (floor = half a frame),
     //    which can sit up to one device period above it depending on phase.
@@ -1507,7 +1545,7 @@ fn log_info(info: &EngineInfo) {
     let l = &info.latency;
     info!("latency budget (mic -> output, typical worst case, excluding driver/hardware):");
     info!(
-        "  input period + RNNoise framing : {:>6.2} ms  ({:.2} + {:.2} ms)",
+        "  input period + RNNoise         : {:>6.2} ms  ({:.2} + {:.2} ms)",
         l.input_side_ms, l.input_period_ms, l.rnnoise_frame_ms
     );
     info!("  resampler in  ({} -> 48000)    : {:>6.2} ms", info.input_rate, l.resample_in_ms);
@@ -1518,12 +1556,13 @@ fn log_info(info: &EngineInfo) {
     );
     info!("  output period                  : {:>6.2} ms", l.output_period_ms);
     info!(
-        "  ≈ total                        : {:>6.2} ms{}",
-        l.total_ms,
-        if info.bypass { "  [RNNoise bypassed]" } else { "" }
+        "  ≈ total                        : {:>6.2} ms",
+        l.total_ms
     );
-    if l.total_ms > 25.0 {
-        warn!("estimated latency exceeds 25 ms; try a smaller --buffer-frames or a 48 kHz device");
+    // RNNoise alone needs 20 ms; 48 kHz devices with 128-frame periods land
+    // at ~33 ms. Beyond 40 ms something (resampling, large periods) adds a lot.
+    if l.total_ms > 40.0 {
+        warn!("estimated latency exceeds 40 ms; try a 48 kHz device or a smaller --buffer-frames");
     }
 }
 
@@ -1542,14 +1581,18 @@ fn snapshot(m: &Metrics, in_rate: u32, out_rate: u32) -> MetricsSnapshot {
         stream_errors: m.stream_errors.load(Ordering::Relaxed),
         in_cb_max: m.in_cb_max.load(Ordering::Relaxed),
         out_cb_max: m.out_cb_max.load(Ordering::Relaxed),
+        gate_gain: f32::from_bits(m.gate_gain_bits.load(Ordering::Relaxed)),
+        agc_gain_db: f32::from_bits(m.agc_gain_db_bits.load(Ordering::Relaxed)),
     }
 }
 
 fn log_stats(s: &MetricsSnapshot) {
     info!(
-        "stats: frames={} vad={:.2} in_q={:.1}ms out_q={:.1}ms cb_max={}/{} | in_overrun={} out_underrun={} out_overrun={} dropped={} errors={}",
+        "stats: frames={} vad={:.2} gate={:.2} agc={:+.1}dB in_q={:.1}ms out_q={:.1}ms cb_max={}/{} | in_overrun={} out_underrun={} out_overrun={} dropped={} errors={}",
         s.frames_processed,
         s.vad,
+        s.gate_gain,
+        s.agc_gain_db,
         s.in_fill_ms,
         s.out_fill_ms,
         s.in_cb_max,

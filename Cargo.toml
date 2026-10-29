@@ -1,6 +1,6 @@
 [package]
 name = "crisp-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Real-time microphone denoiser (RNNoise) with a lock-free, low-latency CPAL pipeline"
@@ -41,6 +41,8 @@ clap = { version = "4.5", features = ["derive"] }
 # Ctrl+C / SIGTERM handling for graceful shutdown.
 ctrlc = { version = "3.4", features = ["termination"] }
 anyhow = "1"
+# WAV I/O for `crisp-rs process` (offline denoising of recordings).
+hound = "3.5"
 log = "0.4"
 env_logger = "0.11"
 # Desktop GUI (optional, feature `gui`).

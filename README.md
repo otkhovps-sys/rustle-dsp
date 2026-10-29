@@ -11,10 +11,12 @@ written in Rust.
   ("Crisp Mic (denoised)" on Linux, VB-Cable / BlackHole on Windows / macOS) that
   Discord, Zoom, Meet, Teams or OBS select as their microphone.
 * Monitor mode plays the clean signal on speakers / headphones for testing.
-* ~23 ms mic-to-output latency at 48 kHz with lock-free SPSC ring buffers between the
-  audio callbacks and a dedicated DSP thread, no allocation and no locks in the
-  real-time callbacks, and drift correction that keeps latency bounded without
-  crackling on bursty sound servers.
+* Noise-reduction presets (Light / Balanced / Strong) with high-pass, voice gate, AGC
+  and limiter around RNNoise, adjustable live, plus offline WAV processing.
+* ~33 ms mic-to-output latency at 48 kHz (20 ms of it is RNNoise itself) with
+  lock-free SPSC ring buffers between the audio callbacks and a dedicated DSP thread,
+  no allocation and no locks in the real-time callbacks, and drift correction that
+  keeps latency bounded without crackling on bursty sound servers.
 
 ## Pipeline
 
@@ -23,21 +25,31 @@ CPAL input cb            DSP worker thread                     CPAL output cb
 (device rate, N ch)      (allocates nothing after start-up)    (device rate, M ch)
 ┌────────────────┐ SPSC  ┌───────────────────────────────┐ SPSC ┌──────────────────┐
 │ downmix → mono │ ────► │ rubato  → 48 kHz              │ ───► │ mono → M ch      │
-│ try_push       │ in_rb │ RNNoise 480-sample frames     │ out  │ try_pop          │
+│ try_push       │ in_rb │ voice chain (below)           │ out  │ try_pop          │
 │ unpark(worker) │       │ rubato  → output device rate  │ _rb  │ silence on empty │
 └────────────────┘       └───────────────────────────────┘      └──────────────────┘
+```
+
+Voice chain (48 kHz mono, per 10 ms frame, `src/voice.rs`):
+
+```
+high-pass 80 Hz ─► RNNoise ─► strength mix ─► voice gate ─► AGC ─► limiter
+                     │  dry (delay-aligned) ─┘      ▲
+                     └──── VAD probability ─────────┘ (also drives AGC)
 ```
 
 * `src/resampler.rs` – streaming wrapper over `rubato::SincFixedIn` (pass-through
   when the device already runs at 48 kHz).
 * `src/denoiser.rs` – wrapper over `nnnoiseless::DenoiseState`, gathers 480-sample
-  frames and converts between ±1.0 floats and the i16 range RNNoise expects.
+  frames, converts between ±1.0 floats and the i16 range RNNoise expects, and returns
+  the dry signal delay-aligned with the network output (its 480-sample model delay).
+* `src/voice.rs` – the voice chain above, presets, and lock-free live controls.
 * `src/audio_engine.rs` – device selection, stream configuration, ring buffers,
   worker thread, latency clamp, graceful shutdown.
 * `src/main.rs` – `clap` CLI (`crisp-rs`).
-* `src/bin/gui.rs` – desktop GUI (`crisp-gui`, egui/eframe): device pickers, period /
-  sample-rate / bypass settings, Start/Stop, live mic & output meters, VAD, latency
-  budget and xrun counters. The UI thread only reads atomics; audio runs exactly the
+* `src/bin/gui.rs` – desktop GUI (`crisp-gui`, egui/eframe): device pickers, noise
+  reduction presets and live controls, Start/Stop, live mic & output meters, VAD, gate
+  and AGC indicators, latency budget and xrun counters. The UI thread only reads atomics; audio runs exactly the
   same engine as the CLI.
 
 ## Downloads
@@ -85,6 +97,38 @@ On Linux the ALSA plugin of the sound server re-creates its stream after every x
 crisp-rs listens to `pactl subscribe` and moves every new stream of its own process
 onto the virtual mic within milliseconds, so routing survives glitches and restarts.
 
+## Noise reduction levels
+
+| Preset | Strength | Voice gate | Use it for |
+|---|---|---|---|
+| **Nhẹ / Light** | 80 % | light (−15 dB) | quiet rooms, most natural voice |
+| **Cân bằng / Balanced** (default) | 100 % | light (−15 dB) | everyday calls |
+| **Mạnh / Strong** | 100 % | strong (−45 dB) | noisy rooms, cafés, open offices |
+
+All presets also enable the 80 Hz high-pass (fan / AC / desk rumble) and AGC with a
+−1 dBFS limiter (consistent speech level, no clipping). Every part can be tuned under
+"Chỉnh chi tiết" / with CLI flags, **while audio is running**, and the A/B switch plays
+the raw microphone through the same latency path for a fair comparison.
+
+* **Strength** mixes the delay-aligned raw signal back in; lower it if the voice
+  sounds "watery" with heavy noise.
+* **Voice gate** uses RNNoise's voice-activity probability (hysteresis 0.6 / 0.3,
+  200 ms hold, 3 ms open, 40 ms close), so words and short gaps stay intact and the
+  level drops only in real pauses — e.g. while you listen to others.
+* **AGC** adapts only while voice is detected (target −20 dBFS RMS, −10…+18 dB), so
+  noise is never pumped up during pauses.
+
+Measured on 12 s of Vietnamese speech mixed with fan noise, 50 Hz hum and keyboard
+clicks (`crisp-rs process`, levels in dBFS, SI-SDR per 10 ms vs. the clean speech):
+
+| Configuration | Noise in long pauses (median) | Noise between words | Speech SI-SDR |
+|---|---|---|---|
+| Unprocessed | −35.5 dB | −34.5 dB | 11.8 dB |
+| RNNoise only (v0.2.0) | −73.0 dB | −44.4 dB | 11.9 dB |
+| Light | −63.8 dB | −43.3 dB | 13.7 dB |
+| Balanced | −82.9 dB | −44.8 dB | 12.7 dB |
+| Strong | −103.7 dB | −44.8 dB | 12.6 dB |
+
 ## Desktop app
 
 ```bash
@@ -118,8 +162,15 @@ crisp-rs run
 # pick devices by index or (case-insensitive) name substring
 crisp-rs run --input "USB Mic" --output "CABLE Input"
 
-# A/B the denoiser without changing latency
+# noise reduction level / fine tuning
+crisp-rs run --virtual-mic --preset strong
+crisp-rs run --virtual-mic --strength 70 --gate light --no-agc
+
+# A/B: raw microphone through the same latency path
 crisp-rs run --bypass
+
+# denoise a recording offline with the same chain (output: 48 kHz mono WAV)
+crisp-rs process meeting.wav meeting-clean.wav --preset balanced
 
 # force a device rate to exercise the resampler path
 crisp-rs run --rate 44100
@@ -138,25 +189,30 @@ by the next run).
 Printed at start-up, e.g. for a 48 kHz device with 128-frame periods:
 
 ```
-input period + RNNoise framing :  12.67 ms  (2.67 + 10.00 ms)
+input period + RNNoise         :  22.67 ms  (2.67 + 20.00 ms)
 resampler in  (48000 -> 48000)  :   0.00 ms
 resampler out (48000 -> 48000)  :   0.00 ms
 output queue (steady state)     :   7.67 ms  (primes at 848 frames)
 output period                   :   2.67 ms
-≈ total                         :  23.00 ms
+≈ total                         :  33.00 ms
 ```
 
 | Devices | Period | Estimated latency |
 |---|---|---|
-| 48 kHz both ends | 128 | 23.0 ms |
-| 44.1 kHz both ends (resampled) | 128 | 27.9 ms |
-| 44.1 kHz both ends (resampled) | 64 | ≈ 23.5 ms |
+| 48 kHz both ends | 128 | 33.0 ms |
+| 48 kHz both ends | 64 | 29.0 ms |
+| 44.1 kHz both ends (resampled) | 128 | 37.9 ms |
+
+RNNoise alone accounts for 20 ms, so a < 25 ms end-to-end target is not reachable with
+it; ~30 ms is far below what chat apps add over the network.
 
 Where the numbers come from:
 
-* **RNNoise framing** – 480 samples = 10 ms, counted once for the whole chain: a sample
-  at position *x* of a frame waits (480 − *x*) for the frame to complete and then *x*
-  while that chunk drains on the output, i.e. exactly 10 ms for every sample.
+* **RNNoise** – 20 ms, counted once for the whole chain. Framing: a sample at position
+  *x* of a frame waits (480 − *x*) for the frame to complete and then *x* while that
+  chunk drains on the output, i.e. exactly 10 ms for every sample. Model delay: the
+  network analyses a 20 ms window and resynthesises by overlap-add, so its output lags
+  its input by one more frame (measured: 480 samples).
 * **Device periods** – `--buffer-frames` (default 128 = 2.67 ms @ 48 kHz) per direction.
 * **Output queue** – the pacer steers the queue's low point to half a frame (5 ms of
   jitter margin for the DSP thread); it sits up to one period above that depending

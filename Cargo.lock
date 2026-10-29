@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "crisp-rs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap 4.6.7",
@@ -682,6 +682,7 @@ dependencies = [
  "eframe",
  "egui",
  "env_logger",
+ "hound",
  "log",
  "nnnoiseless",
  "ringbuf",

@@ -6,6 +6,7 @@ pub mod audio_engine;
 pub mod denoiser;
 pub mod resampler;
 pub mod virtual_mic;
+pub mod voice;
 
 pub use audio_engine::{
     device_catalog, list_devices, DeviceCatalog, DeviceInfo, Engine, EngineConfig, EngineInfo,

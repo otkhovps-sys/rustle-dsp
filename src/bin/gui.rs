@@ -13,6 +13,7 @@
 use std::time::{Duration, Instant};
 
 use crisp_rs::virtual_mic::{self, Availability, VirtualMic};
+use crisp_rs::voice::{GateMode, Preset, VoiceSettings};
 use crisp_rs::{device_catalog, DeviceCatalog, DeviceInfo, Engine, EngineConfig, MetricsSnapshot};
 use eframe::egui::{self, Color32, RichText, Vec2};
 use serde::{Deserialize, Serialize};
@@ -62,7 +63,8 @@ struct Settings {
     output_name: Option<String>,
     buffer_frames: u32,
     rate: u32,
-    bypass: bool,
+    /// Noise-reduction chain (preset, strength, gate, AGC, high-pass, A/B).
+    voice: VoiceSettings,
     auto_start: bool,
 }
 
@@ -74,7 +76,7 @@ impl Default for Settings {
             output_name: None,
             buffer_frames: 128,
             rate: 0,
-            bypass: false,
+            voice: VoiceSettings::default(),
             auto_start: false,
         }
     }
@@ -128,10 +130,13 @@ impl CrispApp {
         style.spacing.button_padding = Vec2::new(12.0, 6.0);
         cc.egui_ctx.set_style(style);
 
-        let settings: Settings = cc
+        let mut settings: Settings = cc
             .storage
             .and_then(|s| eframe::get_value(s, eframe::APP_KEY))
             .unwrap_or_default();
+        // A/B is a momentary comparison: never start a session sending the
+        // unfiltered microphone because it was left on last time.
+        settings.voice.bypass = false;
         let catalog = device_catalog();
         let availability = virtual_mic::availability(&catalog.outputs);
 
@@ -174,7 +179,7 @@ impl CrispApp {
             output: self.output_sel.map(|i| i.to_string()),
             buffer_frames: self.settings.buffer_frames,
             force_rate: (self.settings.rate != 0).then_some(self.settings.rate),
-            bypass: self.settings.bypass,
+            voice: self.settings.voice,
             stats_secs: 0,
         };
 
@@ -286,6 +291,73 @@ impl CrispApp {
                 self.stop();
                 self.fail("Engine đã dừng bất thường (thiết bị bị ngắt?). Bấm Làm mới rồi Bắt đầu lại.".into());
             }
+        }
+    }
+
+    /// Push the current voice settings to the running engine (lock-free).
+    fn apply_voice(&self) {
+        if let Some(engine) = &self.engine {
+            engine.set_voice(self.settings.voice);
+        }
+    }
+
+    /// "Mức lọc" panel. Every control applies live while running.
+    fn voice_controls(&mut self, ui: &mut egui::Ui) {
+        let before = self.settings.voice;
+        let v = &mut self.settings.voice;
+        ui.horizontal(|ui| {
+            ui.strong("Mức lọc");
+            ui.label(RichText::new("thay đổi có hiệu lực ngay khi đang chạy").weak().small());
+        });
+        let current = v.matching_preset();
+        ui.horizontal(|ui| {
+            for (p, label, hint) in [
+                (Preset::Light, "Nhẹ", "Giọng tự nhiên nhất (lọc 80 %) — phòng yên tĩnh"),
+                (Preset::Balanced, "Cân bằng", "Khuyên dùng — lọc đầy đủ, hạ ồn giữa các câu"),
+                (Preset::Strong, "Mạnh", "Phòng ồn, quán cà phê — gần như im khi không nói"),
+            ] {
+                if ui.selectable_label(current == Some(p), label).on_hover_text(hint).clicked() {
+                    let bypass = v.bypass;
+                    *v = VoiceSettings::preset(p);
+                    v.bypass = bypass;
+                }
+            }
+            ui.selectable_label(current.is_none(), "Tuỳ chỉnh")
+                .on_hover_text("Chỉnh từng thông số bên dưới");
+        });
+
+        egui::CollapsingHeader::new("Chỉnh chi tiết")
+            .id_salt("voice_detail")
+            .default_open(current.is_none())
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 20.0], egui::Label::new("Độ mạnh lọc"));
+                    let mut pct = v.strength * 100.0;
+                    if ui
+                        .add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix(" %").step_by(5.0))
+                        .on_hover_text("100 % = lọc tối đa. Giảm xuống nếu giọng bị méo / \"rè nước\".")
+                        .changed()
+                    {
+                        v.strength = pct / 100.0;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 20.0], egui::Label::new("Cổng giọng nói"));
+                    for (g, label) in [(GateMode::Off, "Tắt"), (GateMode::Light, "Nhẹ (−15 dB)"), (GateMode::Strong, "Mạnh (−45 dB)")] {
+                        ui.radio_value(&mut v.gate, g, label);
+                    }
+                })
+                .response
+                .on_hover_text("Hạ âm lượng khi bạn không nói: bỏ tiếng gõ phím, tiếng thở còn sót lại.");
+                ui.checkbox(&mut v.agc, "Tự cân âm lượng giọng nói (AGC) + chống vỡ tiếng");
+                ui.checkbox(&mut v.highpass, "Lọc tiếng ù tần thấp (quạt, điều hoà, rung bàn) < 80 Hz");
+            });
+
+        ui.checkbox(&mut v.bypass, "So sánh A/B: nghe tiếng gốc chưa lọc (độ trễ như nhau)")
+            .on_hover_text("Bật/tắt khi đang chạy để nghe khác biệt. Nhớ tắt sau khi so sánh.");
+
+        if self.settings.voice != before {
+            self.apply_voice();
         }
     }
 
@@ -562,6 +634,33 @@ impl eframe::App for CrispApp {
                             .text(RichText::new(format!("VAD {:.0}%", self.vad_meter * 100.0)).small());
                         ui.add_sized([ui.available_width(), 18.0], bar);
                     });
+                    if running {
+                        ui.horizontal(|ui| {
+                            ui.add_sized([80.0, 18.0], egui::Label::new(""));
+                            let v = self.settings.voice;
+                            if v.bypass {
+                                ui.label(RichText::new("Đang nghe TIẾNG GỐC (A/B)").color(AMBER));
+                            } else {
+                                if v.gate != GateMode::Off {
+                                    let open = s.gate_gain > 0.5;
+                                    ui.label(
+                                        RichText::new(if open { "● cổng mở" } else { "○ cổng đóng (đang im)" })
+                                            .color(if open { GREEN } else { Color32::GRAY })
+                                            .small(),
+                                    );
+                                }
+                                if v.agc {
+                                    ui.label(RichText::new(format!("tự cân âm lượng {:+.1} dB", s.agc_gain_db)).weak().small());
+                                }
+                            }
+                        });
+                    }
+                });
+
+                // ---------------- Noise reduction ----------------
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width());
+                    self.voice_controls(ui);
                 });
 
                 // ---------------- Settings ----------------
@@ -590,7 +689,6 @@ impl eframe::App for CrispApp {
                                         }
                                     });
                             });
-                            ui.checkbox(&mut self.settings.bypass, "Tắt RNNoise (so sánh A/B, độ trễ giữ nguyên)");
                         });
                         ui.checkbox(&mut self.settings.auto_start, "Tự bắt đầu lọc ồn khi mở app");
                     });
@@ -615,7 +713,7 @@ impl eframe::App for CrispApp {
                             });
                             ui.end_row();
                             ui.label("Độ trễ ước tính");
-                            let col = if l.total_ms <= 25.0 { GREEN } else { AMBER };
+                            let col = if l.total_ms <= 40.0 { GREEN } else { AMBER };
                             ui.label(RichText::new(format!("{:.1} ms", l.total_ms)).color(col));
                             ui.end_row();
                             ui.label("Thời gian chạy");
