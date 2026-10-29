@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      macos:
+        description: "Also build macOS (arm64). Needs macOS runners to be available for this repo."
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,15 +44,8 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             ext: ".exe"
-          - name: macos-arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            ext: ""
-          - name: macos-x86_64
-            os: macos-13
-            target: x86_64-apple-darwin
-            ext: ""
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -78,6 +76,33 @@ jobs:
           path: |
             dist/*.zip
             dist/*.tar.gz
+          if-no-files-found: error
+
+  # macOS runners were not available for this repository (the job sat in the
+  # queue until cancelled), so macOS is opt-in via "Run workflow" and never
+  # blocks the Linux/Windows release.
+  build-macos:
+    name: release (macos-arm64)
+    if: github.event_name == 'workflow_dispatch' && inputs.macos
+    needs: check
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: package
+        run: |
+          set -euo pipefail
+          out="crisp-rs-macos-arm64"
+          mkdir -p "dist/$out"
+          cp target/release/crisp-rs target/release/crisp-gui README.md "dist/$out/"
+          cd dist && tar czf "$out.tar.gz" "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crisp-rs-macos-arm64
+          path: dist/*.tar.gz
           if-no-files-found: error
 
   release:

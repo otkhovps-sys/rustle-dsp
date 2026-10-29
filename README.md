@@ -40,10 +40,13 @@ CPAL input cb            DSP worker thread                     CPAL output cb
 
 ## Downloads
 
-Every push builds release binaries for Linux x86_64, Windows x86_64 and macOS
-(arm64 + x86_64) in GitHub Actions (`.github/workflows/build.yml`); grab them from the
-workflow run's **Artifacts**. Pushing a `v*` tag publishes them as a GitHub Release.
-Each archive contains both `crisp-rs` (CLI) and `crisp-gui` (desktop app).
+Prebuilt binaries for **Windows x86_64** and **Linux x86_64** are on the
+[Releases page](https://github.com/otkhovps-sys/rustle-dsp/releases). Each archive
+contains both `crisp-gui` (desktop app) and `crisp-rs` (CLI).
+
+GitHub Actions (`.github/workflows/build.yml`) builds them on every push (see the run's
+**Artifacts**) and publishes a Release when a `v*` tag is pushed. A macOS arm64 build
+is available on demand via **Actions → build → Run workflow → macos**.
 
 ## Build
 
