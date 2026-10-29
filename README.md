@@ -45,7 +45,8 @@ Prebuilt binaries for **Windows x86_64** and **Linux x86_64** are on the
 contains both `crisp-gui` (desktop app) and `crisp-rs` (CLI).
 
 GitHub Actions (`.github/workflows/build.yml`) builds them on every push (see the run's
-**Artifacts**) and publishes a Release when a `v*` tag is pushed. A macOS arm64 build
+**Artifacts**) and publishes a Release when a `v*` tag is pushed, or when
+**Run workflow** is started with a `release_tag` (e.g. `v0.1.1`). A macOS arm64 build
 is available on demand via **Actions → build → Run workflow → macos**.
 
 ## Build

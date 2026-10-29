@@ -11,6 +11,10 @@ on:
         description: "Also build macOS (arm64). Needs macOS runners to be available for this repo."
         type: boolean
         default: false
+      release_tag:
+        description: "If set (e.g. v0.1.0), publish the build as a GitHub Release with this tag."
+        type: string
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -107,7 +111,7 @@ jobs:
 
   release:
     name: GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -119,6 +123,10 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          # Tag push: use that tag. Manual run: create `release_tag` on this commit.
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: crisp-rs ${{ inputs.release_tag || github.ref_name }}
           files: |
             artifacts/*.zip
             artifacts/*.tar.gz
