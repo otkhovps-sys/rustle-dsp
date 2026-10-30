@@ -4,6 +4,7 @@
 
 pub mod audio_engine;
 pub mod denoiser;
+pub mod fx;
 pub mod resampler;
 pub mod virtual_mic;
 pub mod voice;

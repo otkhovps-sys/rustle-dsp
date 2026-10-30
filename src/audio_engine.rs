@@ -38,6 +38,7 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 use crate::denoiser::{FRAME_SIZE, MODEL_DELAY};
+use crate::fx::{FxControls, FxSettings, FX_LATENCY};
 use crate::voice::{VoiceControls, VoiceProcessor, VoiceSettings};
 use crate::resampler::{StreamResampler, RNNOISE_RATE};
 
@@ -58,6 +59,9 @@ pub struct EngineConfig {
     /// Voice processing (preset / strength / gate / AGC / bypass). Can be
     /// changed while running via [`Engine::set_voice`].
     pub voice: VoiceSettings,
+    /// Voice effects (pitch / formant / auto-tune / robot / radio / echo /
+    /// reverb). Can be changed while running via [`Engine::set_fx`].
+    pub fx: FxSettings,
     /// Print runtime statistics every N seconds (0 = never).
     pub stats_secs: u64,
 }
@@ -95,6 +99,8 @@ pub struct Metrics {
     /// Voice-gate gain (0..1) and AGC gain (dB) of the last frame (f32 bits).
     pub gate_gain_bits: AtomicU32,
     pub agc_gain_db_bits: AtomicU32,
+    /// Latency currently added by the effects stage (samples at 48 kHz).
+    pub fx_latency: AtomicUsize,
 }
 
 impl Metrics {
@@ -127,6 +133,8 @@ pub struct MetricsSnapshot {
     pub out_cb_max: usize,
     pub gate_gain: f32,
     pub agc_gain_db: f32,
+    /// Extra latency of the effects stage right now (ms).
+    pub fx_latency_ms: f64,
 }
 
 /// Control flags for shutdown sequencing.
@@ -895,6 +903,7 @@ struct WorkerParams {
     in_rate: u32,
     out_rate: u32,
     voice: Arc<VoiceControls>,
+    fx: Arc<FxControls>,
     /// Frames (at `in_rate`) above which the input backlog is trimmed. This
     /// only fires after a long stall of this thread; normal device drift is
     /// corrected on the output side.
@@ -985,8 +994,9 @@ fn worker_loop(
         // Settings are re-read every iteration (relaxed atomics), so UI
         // changes apply within ~10 ms without any lock.
         let settings = p.voice.get();
+        let fx_settings = p.fx.get();
         clean48.clear();
-        voice.process(&stage48, &settings, &mut |f| clean48.extend_from_slice(f));
+        voice.process(&stage48, &settings, &fx_settings, &mut |f| clean48.extend_from_slice(f));
 
         // --- Stage 3: 48 kHz -> output device rate -----------------------
         outdev.clear();
@@ -1006,15 +1016,17 @@ fn worker_loop(
         metrics
             .agc_gain_db_bits
             .store(voice.agc_gain_db().to_bits(), Ordering::Relaxed);
+        metrics.fx_latency.store(voice.fx_latency(), Ordering::Relaxed);
     }
 
     // --- Shutdown flush: push everything still held in the three stages ----
     stage48.clear();
     to48.flush(&mut |x| stage48.extend_from_slice(x))?;
     let settings = p.voice.get();
+    let fx_settings = p.fx.get();
     clean48.clear();
-    voice.process(&stage48, &settings, &mut |f| clean48.extend_from_slice(f));
-    voice.flush(&settings, &mut |f| clean48.extend_from_slice(f));
+    voice.process(&stage48, &settings, &fx_settings, &mut |f| clean48.extend_from_slice(f));
+    voice.flush(&settings, &fx_settings, &mut |f| clean48.extend_from_slice(f));
     outdev.clear();
     from48.process(&clean48, &mut |y| outdev.extend_from_slice(y))?;
     from48.flush(&mut |y| outdev.extend_from_slice(y))?;
@@ -1069,7 +1081,10 @@ pub struct LatencyBudget {
     pub output_queue_ms: f64,
     pub output_queue_frames: usize,
     pub output_period_ms: f64,
+    /// Without voice effects.
     pub total_ms: f64,
+    /// Added while a pitch effect (voice changer / auto-tune / robot) is on.
+    pub effects_ms: f64,
 }
 
 /// Everything a UI wants to know about a running engine.
@@ -1099,6 +1114,7 @@ pub struct Engine {
     info: EngineInfo,
     metrics: Arc<Metrics>,
     voice: Arc<VoiceControls>,
+    fx: Arc<FxControls>,
     stop_flag: Arc<AtomicBool>,
     control: Option<JoinHandle<Result<()>>>,
 }
@@ -1114,15 +1130,17 @@ impl Engine {
         let metrics = Arc::new(Metrics::default());
         metrics.gate_gain_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         let voice = Arc::new(VoiceControls::new(cfg.voice));
+        let fx = Arc::new(FxControls::new(cfg.fx));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel::<ControlMsg>();
 
         let thread_metrics = metrics.clone();
         let thread_voice = voice.clone();
+        let thread_fx = fx.clone();
         let thread_stop = stop_flag.clone();
         let control = thread::Builder::new()
             .name("crisp-control".into())
-            .spawn(move || control_thread(cfg, thread_metrics, thread_voice, thread_stop, tx))
+            .spawn(move || control_thread(cfg, thread_metrics, thread_voice, thread_fx, thread_stop, tx))
             .context("spawning control thread")?;
 
         match rx.recv() {
@@ -1130,6 +1148,7 @@ impl Engine {
                 info: *info,
                 metrics,
                 voice,
+                fx,
                 stop_flag,
                 control: Some(control),
             }),
@@ -1164,6 +1183,16 @@ impl Engine {
 
     pub fn voice(&self) -> VoiceSettings {
         self.voice.get()
+    }
+
+    /// Change the voice effects while running (lock-free). Enabling or
+    /// disabling a pitch effect crossfades over one 10 ms frame.
+    pub fn set_fx(&self, s: FxSettings) {
+        self.fx.set(s);
+    }
+
+    pub fn fx(&self) -> FxSettings {
+        self.fx.get()
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -1250,10 +1279,11 @@ fn control_thread(
     cfg: EngineConfig,
     metrics: Arc<Metrics>,
     voice: Arc<VoiceControls>,
+    fx: Arc<FxControls>,
     stop_flag: Arc<AtomicBool>,
     tx: std::sync::mpsc::Sender<ControlMsg>,
 ) -> Result<()> {
-    let started = match start_pipeline(&cfg, metrics.clone(), voice) {
+    let started = match start_pipeline(&cfg, metrics.clone(), voice, fx) {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("{e:#}");
@@ -1312,6 +1342,7 @@ fn start_pipeline(
     cfg: &EngineConfig,
     metrics: Arc<Metrics>,
     voice: Arc<VoiceControls>,
+    fx: Arc<FxControls>,
 ) -> Result<Started> {
     let host = cpal::default_host();
     info!("audio host: {:?}", host.id());
@@ -1372,6 +1403,7 @@ fn start_pipeline(
             in_rate,
             out_rate,
             voice: voice.clone(),
+            fx: fx.clone(),
             // Stall recovery: more than 250 ms (plus one input chunk) waiting
             // means this thread was not scheduled; keep one frame and go on.
             in_backlog_limit: in_rate as usize / 4 + in_period,
@@ -1518,6 +1550,7 @@ fn latency_budget(in_spec: &StreamSpec, out_spec: &StreamSpec, prime: usize) -> 
         output_queue_frames: prime,
         output_period_ms,
         total_ms,
+        effects_ms: ms(FX_LATENCY, RNNOISE_RATE),
     }
 }
 
@@ -1556,8 +1589,8 @@ fn log_info(info: &EngineInfo) {
     );
     info!("  output period                  : {:>6.2} ms", l.output_period_ms);
     info!(
-        "  ≈ total                        : {:>6.2} ms",
-        l.total_ms
+        "  ≈ total                        : {:>6.2} ms  (+{:.1} ms while a pitch effect is on)",
+        l.total_ms, l.effects_ms
     );
     // RNNoise alone needs 20 ms; 48 kHz devices with 128-frame periods land
     // at ~33 ms. Beyond 40 ms something (resampling, large periods) adds a lot.
@@ -1583,6 +1616,7 @@ fn snapshot(m: &Metrics, in_rate: u32, out_rate: u32) -> MetricsSnapshot {
         out_cb_max: m.out_cb_max.load(Ordering::Relaxed),
         gate_gain: f32::from_bits(m.gate_gain_bits.load(Ordering::Relaxed)),
         agc_gain_db: f32::from_bits(m.agc_gain_db_bits.load(Ordering::Relaxed)),
+        fx_latency_ms: ms(m.fx_latency.load(Ordering::Relaxed), RNNOISE_RATE),
     }
 }
 

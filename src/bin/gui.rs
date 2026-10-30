@@ -13,7 +13,8 @@
 use std::time::{Duration, Instant};
 
 use crisp_rs::virtual_mic::{self, Availability, VirtualMic};
-use crisp_rs::voice::{GateMode, Preset, VoiceSettings};
+use crisp_rs::fx::{Extra, FxPreset, FxSettings, Scale, FORMANT_RANGE, PITCH_RANGE};
+use crisp_rs::voice::{GateMode, Preset, VoiceSettings, RELIEF_MAX};
 use crisp_rs::{device_catalog, DeviceCatalog, DeviceInfo, Engine, EngineConfig, MetricsSnapshot};
 use eframe::egui::{self, Color32, RichText, Vec2};
 use serde::{Deserialize, Serialize};
@@ -65,6 +66,8 @@ struct Settings {
     rate: u32,
     /// Noise-reduction chain (preset, strength, gate, AGC, high-pass, A/B).
     voice: VoiceSettings,
+    /// Voice changer / auto-tune / effects.
+    fx: FxSettings,
     auto_start: bool,
 }
 
@@ -77,6 +80,7 @@ impl Default for Settings {
             buffer_frames: 128,
             rate: 0,
             voice: VoiceSettings::default(),
+            fx: FxSettings::default(),
             auto_start: false,
         }
     }
@@ -180,6 +184,7 @@ impl CrispApp {
             buffer_frames: self.settings.buffer_frames,
             force_rate: (self.settings.rate != 0).then_some(self.settings.rate),
             voice: self.settings.voice,
+            fx: self.settings.fx,
             stats_secs: 0,
         };
 
@@ -312,9 +317,9 @@ impl CrispApp {
         let current = v.matching_preset();
         ui.horizontal(|ui| {
             for (p, label, hint) in [
-                (Preset::Light, "Nhẹ", "Giọng tự nhiên nhất (lọc 80 %) — phòng yên tĩnh"),
-                (Preset::Balanced, "Cân bằng", "Khuyên dùng — lọc đầy đủ, hạ ồn giữa các câu"),
-                (Preset::Strong, "Mạnh", "Phòng ồn, quán cà phê — gần như im khi không nói"),
+                (Preset::Light, "Nhẹ", "Giọng tự nhiên nhất — phòng yên tĩnh"),
+                (Preset::Balanced, "Cân bằng", "Khuyên dùng — giọng tự nhiên, im hẳn giữa các câu"),
+                (Preset::Strong, "Mạnh", "Phòng ồn, quán cà phê — lọc tối đa kể cả khi đang nói"),
             ] {
                 if ui.selectable_label(current == Some(p), label).on_hover_text(hint).clicked() {
                     let bypass = v.bypass;
@@ -342,6 +347,17 @@ impl CrispApp {
                     }
                 });
                 ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 20.0], egui::Label::new("Giữ giọng tự nhiên"));
+                    let mut pct = v.voice_relief * 100.0;
+                    if ui
+                        .add(egui::Slider::new(&mut pct, 0.0..=RELIEF_MAX * 100.0).suffix(" %").step_by(5.0))
+                        .on_hover_text("Khi bạn đang nói, lọc nhẹ tay hơn chừng này (tiếng nói đã che tạp âm) để giọng không bị méo. Khoảng lặng vẫn lọc tối đa. Giảm về 0 nếu phòng rất ồn.")
+                        .changed()
+                    {
+                        v.voice_relief = pct / 100.0;
+                    }
+                });
+                ui.horizontal(|ui| {
                     ui.add_sized([110.0, 20.0], egui::Label::new("Cổng giọng nói"));
                     for (g, label) in [(GateMode::Off, "Tắt"), (GateMode::Light, "Nhẹ (−15 dB)"), (GateMode::Strong, "Mạnh (−45 dB)")] {
                         ui.radio_value(&mut v.gate, g, label);
@@ -349,7 +365,8 @@ impl CrispApp {
                 })
                 .response
                 .on_hover_text("Hạ âm lượng khi bạn không nói: bỏ tiếng gõ phím, tiếng thở còn sót lại.");
-                ui.checkbox(&mut v.agc, "Tự cân âm lượng giọng nói (AGC) + chống vỡ tiếng");
+                ui.checkbox(&mut v.agc, "Tự cân âm lượng (AGC) — chỉ bật nếu app không tự làm (OBS, ghi âm)")
+                    .on_hover_text("Discord, Zoom, Meet, Teams đã có AGC riêng; bật cả hai sẽ làm âm lượng nhấp nhô.");
                 ui.checkbox(&mut v.highpass, "Lọc tiếng ù tần thấp (quạt, điều hoà, rung bàn) < 80 Hz");
             });
 
@@ -358,6 +375,110 @@ impl CrispApp {
 
         if self.settings.voice != before {
             self.apply_voice();
+        }
+    }
+
+    fn apply_fx(&self) {
+        if let Some(engine) = &self.engine {
+            engine.set_fx(self.settings.fx);
+        }
+    }
+
+    /// "Hiệu ứng giọng" panel (voice changer, auto-tune, effects). Live.
+    fn fx_controls(&mut self, ui: &mut egui::Ui) {
+        let before = self.settings.fx;
+        let f = &mut self.settings.fx;
+        ui.horizontal(|ui| {
+            ui.strong("Hiệu ứng giọng");
+            ui.label(RichText::new("đổi giọng / auto-tune thêm ~38 ms trễ").weak().small());
+        });
+        let current = f.matching_preset();
+        let presets: [(FxPreset, &str, &str); 10] = [
+            (FxPreset::Off, "Tắt", "Giọng thật, không hiệu ứng"),
+            (FxPreset::Deep, "Trầm", "Giọng trầm, dày (−4 cung)"),
+            (FxPreset::High, "Cao", "Giọng cao, sáng (+5 cung)"),
+            (FxPreset::Child, "Trẻ con", "Giọng trẻ con / hoạt hình (+8 cung)"),
+            (FxPreset::Monster, "Quái vật", "Giọng quái vật (−8 cung + vang)"),
+            (FxPreset::Robot, "Robot", "Giọng robot đều đều"),
+            (FxPreset::AutoTune, "Auto-tune", "Bắt về nốt nhạc gần nhất (kiểu T-Pain)"),
+            (FxPreset::Radio, "Radio", "Bộ đàm / điện thoại"),
+            (FxPreset::Echo, "Vọng", "Tiếng vọng"),
+            (FxPreset::Cave, "Hang động", "Phòng rộng / hang động"),
+        ];
+        ui.horizontal_wrapped(|ui| {
+            for (p, label, hint) in presets {
+                if ui.selectable_label(current == Some(p), label).on_hover_text(hint).clicked() {
+                    *f = FxSettings::preset(p);
+                }
+            }
+            if f.enabled && current.is_none() {
+                let _ = ui.selectable_label(true, "Tuỳ chỉnh");
+            }
+        });
+
+        egui::CollapsingHeader::new("Chỉnh hiệu ứng")
+            .id_salt("fx_detail")
+            .default_open(false)
+            .show(ui, |ui| {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 20.0], egui::Label::new("Cao độ"));
+                    changed |= ui
+                        .add(egui::Slider::new(&mut f.pitch, -PITCH_RANGE..=PITCH_RANGE).suffix(" cung").step_by(0.5))
+                        .on_hover_text("Nâng / hạ giọng. 12 cung = 1 quãng tám.")
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 20.0], egui::Label::new("Âm sắc (formant)"));
+                    changed |= ui
+                        .add(egui::Slider::new(&mut f.formant, -FORMANT_RANGE..=FORMANT_RANGE).suffix(" cung").step_by(0.5))
+                        .on_hover_text("Âm + = giọng mỏng / nữ tính hơn, âm − = dày / nam tính hơn. 0 = giữ âm sắc thật.")
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    changed |= ui.checkbox(&mut f.autotune, "Auto-tune").changed();
+                    ui.add_enabled_ui(f.autotune, |ui| {
+                        const KEYS: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+                        egui::ComboBox::from_id_salt("key")
+                            .width(56.0)
+                            .selected_text(KEYS[usize::from(f.key % 12)])
+                            .show_ui(ui, |ui| {
+                                for (i, k) in KEYS.iter().enumerate() {
+                                    changed |= ui.selectable_value(&mut f.key, i as u8, *k).changed();
+                                }
+                            });
+                        egui::ComboBox::from_id_salt("scale")
+                            .width(96.0)
+                            .selected_text(match f.scale {
+                                Scale::Chromatic => "Mọi nốt",
+                                Scale::Major => "Trưởng",
+                                Scale::Minor => "Thứ",
+                            })
+                            .show_ui(ui, |ui| {
+                                changed |= ui.selectable_value(&mut f.scale, Scale::Chromatic, "Mọi nốt").changed();
+                                changed |= ui.selectable_value(&mut f.scale, Scale::Major, "Trưởng").changed();
+                                changed |= ui.selectable_value(&mut f.scale, Scale::Minor, "Thứ").changed();
+                            });
+                        changed |= ui
+                            .add(egui::Slider::new(&mut f.retune_ms, 0.0..=300.0).suffix(" ms").text("tốc độ"))
+                            .on_hover_text("0 ms = bắt nốt tức thì (rõ hiệu ứng), ~150 ms = tự nhiên hơn")
+                            .changed();
+                    });
+                });
+                changed |= ui.checkbox(&mut f.robot, "Robot (giọng đều một nốt)").changed();
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 20.0], egui::Label::new("Hiệu ứng thêm"));
+                    for (e, label) in [(Extra::None, "Không"), (Extra::Radio, "Radio"), (Extra::Echo, "Vọng"), (Extra::Reverb, "Hang động")] {
+                        changed |= ui.radio_value(&mut f.extra, e, label).changed();
+                    }
+                });
+                if changed {
+                    f.enabled = f.pitch.abs() > 0.01 || f.formant.abs() > 0.01 || f.autotune || f.robot || f.extra != Extra::None;
+                }
+            });
+
+        if self.settings.fx != before {
+            self.apply_fx();
         }
     }
 
@@ -652,6 +773,11 @@ impl eframe::App for CrispApp {
                                 if v.agc {
                                     ui.label(RichText::new(format!("tự cân âm lượng {:+.1} dB", s.agc_gain_db)).weak().small());
                                 }
+                                if self.settings.fx.enabled {
+                                    let name = fx_name(&self.settings.fx);
+                                    ui.label(RichText::new(format!("🎭 {name}")).color(Color32::from_rgb(200, 140, 255)).small())
+                                        .on_hover_text("Hiệu ứng giọng đang bật — người nghe sẽ nghe giọng đã đổi");
+                                }
                             }
                         });
                     }
@@ -661,6 +787,12 @@ impl eframe::App for CrispApp {
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     self.voice_controls(ui);
+                });
+
+                // ---------------- Voice effects ----------------
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width());
+                    self.fx_controls(ui);
                 });
 
                 // ---------------- Settings ----------------
@@ -714,7 +846,13 @@ impl eframe::App for CrispApp {
                             ui.end_row();
                             ui.label("Độ trễ ước tính");
                             let col = if l.total_ms <= 40.0 { GREEN } else { AMBER };
-                            ui.label(RichText::new(format!("{:.1} ms", l.total_ms)).color(col));
+                            let total = l.total_ms + self.last_snapshot.fx_latency_ms;
+                            let col = if total <= 40.0 { col } else { AMBER };
+                            ui.label(RichText::new(if self.last_snapshot.fx_latency_ms > 0.0 {
+                                format!("{total:.1} ms (gồm {:.0} ms hiệu ứng giọng)", self.last_snapshot.fx_latency_ms)
+                            } else {
+                                format!("{total:.1} ms")
+                            }).color(col));
                             ui.end_row();
                             ui.label("Thời gian chạy");
                             ui.label(format_duration(self.started_at.map(|t| t.elapsed()).unwrap_or_default()));
@@ -746,6 +884,22 @@ impl eframe::App for CrispApp {
         // remove the Linux virtual mic.
         self.stop();
         self.vmic = None;
+    }
+}
+
+/// Short Vietnamese name of the active voice effect.
+fn fx_name(f: &FxSettings) -> String {
+    match f.matching_preset() {
+        Some(FxPreset::Deep) => "Giọng trầm".into(),
+        Some(FxPreset::High) => "Giọng cao".into(),
+        Some(FxPreset::Child) => "Trẻ con".into(),
+        Some(FxPreset::Monster) => "Quái vật".into(),
+        Some(FxPreset::Robot) => "Robot".into(),
+        Some(FxPreset::AutoTune) => "Auto-tune".into(),
+        Some(FxPreset::Radio) => "Radio".into(),
+        Some(FxPreset::Echo) => "Vọng".into(),
+        Some(FxPreset::Cave) => "Hang động".into(),
+        _ => format!("Tuỳ chỉnh ({:+.1} cung)", f.pitch),
     }
 }
 

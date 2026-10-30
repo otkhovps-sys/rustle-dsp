@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crisp_rs::resampler::{StreamResampler, RNNOISE_RATE};
+use crisp_rs::fx::{Extra, FxPreset, FxSettings, Scale};
 use crisp_rs::voice::{GateMode, Preset, VoiceSettings};
 
 use crisp_rs::virtual_mic::VirtualMic;
@@ -49,16 +50,177 @@ enum Command {
         output: PathBuf,
         #[command(flatten)]
         voice: VoiceArgs,
+        #[command(flatten)]
+        fx: FxArgs,
     },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum VoicePresetArg {
+    Off,
+    Deep,
+    High,
+    Child,
+    Monster,
+    Robot,
+    Autotune,
+    Radio,
+    Echo,
+    Cave,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ScaleArg {
+    Chromatic,
+    Major,
+    Minor,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EffectArg {
+    None,
+    Radio,
+    Echo,
+    Reverb,
+}
+
+/// Voice-effect options shared by `run` and `process`.
+#[derive(Args, Debug, Clone)]
+struct FxArgs {
+    /// Voice-changer preset; the options below override parts of it.
+    #[arg(long = "voice", value_enum, default_value_t = VoicePresetArg::Off)]
+    voice_preset: VoicePresetArg,
+
+    /// Pitch shift in semitones (-12..12). Adds ~38 ms latency.
+    #[arg(long, allow_hyphen_values = true)]
+    pitch: Option<f32>,
+
+    /// Formant (timbre) shift in semitones (-5..5). 0 keeps the natural timbre.
+    #[arg(long, allow_hyphen_values = true)]
+    formant: Option<f32>,
+
+    /// Auto-tune to this key (C, C#, D, ..., B). Adds ~38 ms latency.
+    #[arg(long, value_name = "KEY")]
+    autotune: Option<String>,
+
+    /// Scale for --autotune.
+    #[arg(long, value_enum, default_value_t = ScaleArg::Chromatic)]
+    scale: ScaleArg,
+
+    /// Auto-tune retune time in ms (0 = hard/robotic, ~150 = natural).
+    #[arg(long, default_value_t = 0.0)]
+    retune_ms: f32,
+
+    /// Robot voice (monotone).
+    #[arg(long)]
+    robot: bool,
+
+    /// Extra effect after the voice changer.
+    #[arg(long, value_enum)]
+    effect: Option<EffectArg>,
+}
+
+impl FxArgs {
+    fn settings(&self) -> Result<FxSettings> {
+        let mut s = FxSettings::preset(match self.voice_preset {
+            VoicePresetArg::Off => FxPreset::Off,
+            VoicePresetArg::Deep => FxPreset::Deep,
+            VoicePresetArg::High => FxPreset::High,
+            VoicePresetArg::Child => FxPreset::Child,
+            VoicePresetArg::Monster => FxPreset::Monster,
+            VoicePresetArg::Robot => FxPreset::Robot,
+            VoicePresetArg::Autotune => FxPreset::AutoTune,
+            VoicePresetArg::Radio => FxPreset::Radio,
+            VoicePresetArg::Echo => FxPreset::Echo,
+            VoicePresetArg::Cave => FxPreset::Cave,
+        });
+        let mut touched = false;
+        if let Some(p) = self.pitch {
+            anyhow::ensure!((-12.0..=12.0).contains(&p), "--pitch must be within -12..12");
+            s.pitch = p;
+            touched = true;
+        }
+        if let Some(f) = self.formant {
+            anyhow::ensure!((-5.0..=5.0).contains(&f), "--formant must be within -5..5");
+            s.formant = f;
+            touched = true;
+        }
+        if let Some(k) = &self.autotune {
+            s.autotune = true;
+            s.key = parse_key(k)?;
+            touched = true;
+        }
+        s.scale = match self.scale {
+            ScaleArg::Chromatic => Scale::Chromatic,
+            ScaleArg::Major => Scale::Major,
+            ScaleArg::Minor => Scale::Minor,
+        };
+        if self.retune_ms > 0.0 {
+            s.retune_ms = self.retune_ms;
+        }
+        if self.robot {
+            s.robot = true;
+            touched = true;
+        }
+        if let Some(e) = self.effect {
+            s.extra = match e {
+                EffectArg::None => Extra::None,
+                EffectArg::Radio => Extra::Radio,
+                EffectArg::Echo => Extra::Echo,
+                EffectArg::Reverb => Extra::Reverb,
+            };
+            touched = true;
+        }
+        if touched {
+            s.enabled = true;
+        }
+        Ok(s)
+    }
+
+    fn defaults() -> Self {
+        Self {
+            voice_preset: VoicePresetArg::Off,
+            pitch: None,
+            formant: None,
+            autotune: None,
+            scale: ScaleArg::Chromatic,
+            retune_ms: 0.0,
+            robot: false,
+            effect: None,
+        }
+    }
+}
+
+/// "C", "c#", "Db", "A#" … → 0..=11.
+fn parse_key(k: &str) -> Result<u8> {
+    let k = k.trim();
+    let mut chars = k.chars();
+    let base = match chars.next().map(|c| c.to_ascii_uppercase()) {
+        Some('C') => 0,
+        Some('D') => 2,
+        Some('E') => 4,
+        Some('F') => 5,
+        Some('G') => 7,
+        Some('A') => 9,
+        Some('B') => 11,
+        _ => anyhow::bail!("unknown key {k:?} (use C, C#, Db, ..., B)"),
+    };
+    let acc = match chars.as_str() {
+        "" => 0,
+        "#" | "s" => 1,
+        "b" => -1,
+        other => anyhow::bail!("unknown accidental {other:?} in key {k:?}"),
+    };
+    Ok(((base + acc + 12) % 12) as u8)
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum PresetArg {
-    /// Natural voice: 80 % strength + light voice gate (quiet rooms).
+    /// Most natural voice (70 % voice relief) + light gate (quiet rooms).
     Light,
-    /// Full RNNoise + light voice gate (recommended).
+    /// Natural voice (50 % voice relief) + light gate (recommended).
     Balanced,
-    /// Full RNNoise + strong voice gate (noisy rooms).
+    /// Maximum cleaning, no relief, strong gate (noisy rooms).
     Strong,
 }
 
@@ -80,13 +242,20 @@ struct VoiceArgs {
     #[arg(long, value_parser = clap::value_parser!(u8).range(0..=100))]
     strength: Option<u8>,
 
+    /// Keep the voice natural: reduce the strength by this percentage while
+    /// voice is detected (0-80). Pauses stay fully cleaned. Presets: light 70,
+    /// balanced 50, strong 0.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(0..=80))]
+    natural: Option<u8>,
+
     /// Voice gate between phrases: off, light (-15 dB) or strong (-45 dB).
     #[arg(long, value_enum)]
     gate: Option<GateArg>,
 
-    /// Disable automatic gain control (speech level normalisation).
+    /// Enable slow automatic gain control (speech level normalisation). Off by
+    /// default: Discord / Zoom / Meet / Teams already have one.
     #[arg(long)]
-    no_agc: bool,
+    agc: bool,
 
     /// Disable the 80 Hz high-pass (rumble) filter.
     #[arg(long)]
@@ -107,6 +276,9 @@ impl VoiceArgs {
         if let Some(p) = self.strength {
             s.strength = f32::from(p) / 100.0;
         }
+        if let Some(p) = self.natural {
+            s.voice_relief = f32::from(p) / 100.0;
+        }
         if let Some(g) = self.gate {
             s.gate = match g {
                 GateArg::Off => GateMode::Off,
@@ -114,7 +286,7 @@ impl VoiceArgs {
                 GateArg::Strong => GateMode::Strong,
             };
         }
-        s.agc &= !self.no_agc;
+        s.agc |= self.agc;
         s.highpass &= !self.no_highpass;
         s.bypass = self.bypass;
         s
@@ -124,8 +296,9 @@ impl VoiceArgs {
         Self {
             preset: PresetArg::Balanced,
             strength: None,
+            natural: None,
             gate: None,
-            no_agc: false,
+            agc: false,
             no_highpass: false,
             bypass: false,
         }
@@ -161,6 +334,9 @@ struct RunArgs {
     #[command(flatten)]
     voice: VoiceArgs,
 
+    #[command(flatten)]
+    fx: FxArgs,
+
     /// Print pipeline statistics every N seconds (0 = off).
     #[arg(long, default_value_t = 5)]
     stats_secs: u64,
@@ -181,12 +357,13 @@ fn main() -> Result<()> {
             input,
             output,
             voice,
-        } => process_file(&input, &output, &voice.settings()),
+            fx,
+        } => process_file(&input, &output, &voice.settings(), &fx.settings()?),
     }
 }
 
 /// Offline: WAV in → mono → 48 kHz → voice chain → 48 kHz mono 16-bit WAV.
-fn process_file(input: &Path, output: &Path, s: &VoiceSettings) -> Result<()> {
+fn process_file(input: &Path, output: &Path, s: &VoiceSettings, fx: &FxSettings) -> Result<()> {
     let mut reader = hound::WavReader::open(input)
         .with_context(|| format!("opening {}", input.display()))?;
     let spec = reader.spec();
@@ -214,7 +391,7 @@ fn process_file(input: &Path, output: &Path, s: &VoiceSettings) -> Result<()> {
     rs.flush(&mut |x| at48.extend_from_slice(x))?;
 
     let started = std::time::Instant::now();
-    let out = crisp_rs::voice::process_buffer(&at48, s);
+    let out = crisp_rs::voice::process_buffer_fx(&at48, s, fx);
     let elapsed = started.elapsed().as_secs_f64();
 
     let mut writer = hound::WavWriter::create(
@@ -253,6 +430,7 @@ impl RunArgs {
             buffer_frames: 128,
             rate: None,
             voice: VoiceArgs::defaults(),
+            fx: FxArgs::defaults(),
             stats_secs: 5,
         }
     }
@@ -287,9 +465,13 @@ fn run(args: RunArgs) -> Result<()> {
         buffer_frames: args.buffer_frames,
         force_rate: args.rate,
         voice: args.voice.settings(),
+        fx: args.fx.settings()?,
         stats_secs: args.stats_secs,
     };
 
+    if cfg.fx.enabled {
+        log::info!("voice effects: {:?}", cfg.fx);
+    }
     if !args.virtual_mic {
         return audio_engine::run(cfg, running);
     }

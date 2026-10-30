@@ -1,6 +1,6 @@
 [package]
 name = "crisp-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Real-time microphone denoiser (RNNoise) with a lock-free, low-latency CPAL pipeline"

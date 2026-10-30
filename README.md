@@ -11,8 +11,11 @@ written in Rust.
   ("Crisp Mic (denoised)" on Linux, VB-Cable / BlackHole on Windows / macOS) that
   Discord, Zoom, Meet, Teams or OBS select as their microphone.
 * Monitor mode plays the clean signal on speakers / headphones for testing.
-* Noise-reduction presets (Light / Balanced / Strong) with high-pass, voice gate, AGC
-  and limiter around RNNoise, adjustable live, plus offline WAV processing.
+* Noise-reduction presets (Light / Balanced / Strong) with high-pass, speech-aware
+  strength, voice gate, optional AGC and limiter around RNNoise, adjustable live, plus
+  offline WAV processing.
+* Voice effects: voice changer (pitch + formant, TD-PSOLA), auto-tune, robot, radio,
+  echo, reverb.
 * ~33 ms mic-to-output latency at 48 kHz (20 ms of it is RNNoise itself) with
   lock-free SPSC ring buffers between the audio callbacks and a dedicated DSP thread,
   no allocation and no locks in the real-time callbacks, and drift correction that
@@ -30,12 +33,12 @@ CPAL input cb            DSP worker thread                     CPAL output cb
 └────────────────┘       └───────────────────────────────┘      └──────────────────┘
 ```
 
-Voice chain (48 kHz mono, per 10 ms frame, `src/voice.rs`):
+Voice chain (48 kHz mono, per 10 ms frame, `src/voice.rs`, `src/fx.rs`):
 
 ```
-high-pass 80 Hz ─► RNNoise ─► strength mix ─► voice gate ─► AGC ─► limiter
-                     │  dry (delay-aligned) ─┘      ▲
-                     └──── VAD probability ─────────┘ (also drives AGC)
+high-pass 80 Hz ─► RNNoise ─► speech-aware mix ─► voice gate ─► AGC ─► limiter ─► effects ─► limiter
+                     │  dry (delay-aligned) ─┘           ▲
+                     └──── VAD probability ──────────────┘ (also drives mix and AGC)
 ```
 
 * `src/resampler.rs` – streaming wrapper over `rubato::SincFixedIn` (pass-through
@@ -44,6 +47,8 @@ high-pass 80 Hz ─► RNNoise ─► strength mix ─► voice gate ─► AGC 
   frames, converts between ±1.0 floats and the i16 range RNNoise expects, and returns
   the dry signal delay-aligned with the network output (its 480-sample model delay).
 * `src/voice.rs` – the voice chain above, presets, and lock-free live controls.
+* `src/fx.rs` – voice effects: YIN pitch tracker, TD-PSOLA pitch/formant engine,
+  auto-tune, robot, radio, echo, reverb; lock-free live controls.
 * `src/audio_engine.rs` – device selection, stream configuration, ring buffers,
   worker thread, latency clamp, graceful shutdown.
 * `src/main.rs` – `clap` CLI (`crisp-rs`).
@@ -99,35 +104,88 @@ onto the virtual mic within milliseconds, so routing survives glitches and resta
 
 ## Noise reduction levels
 
-| Preset | Strength | Voice gate | Use it for |
+| Preset | Voice relief | Voice gate | Use it for |
 |---|---|---|---|
-| **Nhẹ / Light** | 80 % | light (−15 dB) | quiet rooms, most natural voice |
-| **Cân bằng / Balanced** (default) | 100 % | light (−15 dB) | everyday calls |
-| **Mạnh / Strong** | 100 % | strong (−45 dB) | noisy rooms, cafés, open offices |
+| **Nhẹ / Light** | 70 % | light (−15 dB) | quiet rooms, most natural voice |
+| **Cân bằng / Balanced** (default) | 50 % | light (−15 dB) | everyday calls |
+| **Mạnh / Strong** | 0 % | strong (−45 dB) | noisy rooms, cafés, open offices |
 
-All presets also enable the 80 Hz high-pass (fan / AC / desk rumble) and AGC with a
-−1 dBFS limiter (consistent speech level, no clipping). Every part can be tuned under
+All presets run RNNoise at full strength in pauses and enable the 80 Hz high-pass
+(fan / AC / desk rumble) and a −1 dBFS limiter. Every part can be tuned under
 "Chỉnh chi tiết" / with CLI flags, **while audio is running**, and the A/B switch plays
 the raw microphone through the same latency path for a fair comparison.
 
-* **Strength** mixes the delay-aligned raw signal back in; lower it if the voice
-  sounds "watery" with heavy noise.
+* **Voice relief** ("Giữ giọng tự nhiên"): while voice is detected, part of the
+  delay-aligned raw signal is mixed back in. Speech masks the residual noise, and what
+  you would otherwise hear are RNNoise's own artefacts ("watery" voice). Pauses stay
+  fully cleaned. In very loud rooms the voice detector fires on noise, so the Strong
+  preset uses none.
 * **Voice gate** uses RNNoise's voice-activity probability (hysteresis 0.6 / 0.3,
   200 ms hold, 3 ms open, 40 ms close), so words and short gaps stay intact and the
   level drops only in real pauses — e.g. while you listen to others.
-* **AGC** adapts only while voice is detected (target −20 dBFS RMS, −10…+18 dB), so
-  noise is never pumped up during pauses.
+* **AGC** is **off** in every preset: Discord / Zoom / Meet / Teams run their own, and
+  two AGCs in series pump. When enabled (OBS, recorders) it is deliberately slow: ~1 s
+  speech-level estimate, at most 3 dB/s, target −23 dBFS.
 
-Measured on 12 s of Vietnamese speech mixed with fan noise, 50 Hz hum and keyboard
-clicks (`crisp-rs process`, levels in dBFS, SI-SDR per 10 ms vs. the clean speech):
+Measured on real speech (two LibriSpeech readers, male ~100 Hz and female ~220 Hz,
+normalised to −26 dBFS) with fan noise, 50 Hz hum and keyboard clicks added.
+"Clean speech" = processing the speech with no noise at all, i.e. pure distortion:
 
-| Configuration | Noise in long pauses (median) | Noise between words | Speech SI-SDR |
-|---|---|---|---|
-| Unprocessed | −35.5 dB | −34.5 dB | 11.8 dB |
-| RNNoise only (v0.2.0) | −73.0 dB | −44.4 dB | 11.9 dB |
-| Light | −63.8 dB | −43.3 dB | 13.7 dB |
-| Balanced | −82.9 dB | −44.8 dB | 12.7 dB |
-| Strong | −103.7 dB | −44.8 dB | 12.6 dB |
+| Configuration | Clean speech SI-SDR | Noisy (10 dB SNR) SI-SDR | Pause noise (median) | Noisy (0 dB SNR) pause noise |
+|---|---|---|---|---|
+| Unprocessed | ∞ | 10.0 dB | −36 dB | −26 dB |
+| v0.3.0 Balanced (fast AGC) | 10.1 – 10.9 dB | | | |
+| RNNoise only | 14.5 dB | 10.7 dB | −70.8 dB | −57.4 dB |
+| Light | **23.9 dB** | 13.0 dB | −82.2 dB | −47.3 dB |
+| Balanced | 21.3 dB | 12.9 dB | −82.7 dB | −49.1 dB |
+| Strong | 16.4 dB | 11.5 dB | **−98.2 dB** | **−58.2 dB** |
+
+v0.3.0's AGC reacted every 10 ms and squashed each loud syllable; that, not RNNoise,
+was the main audible distortion. Defaults for voice relief were chosen from a sweep:
+at 10 dB SNR overall SI-SDR peaks around 50–70 %, at 0 dB SNR relief lets noise into
+pauses — hence 0 % for Strong.
+
+## Voice effects (voice changer, auto-tune, ...)
+
+Applied after noise reduction, live, in the app ("Hiệu ứng giọng") or with CLI flags.
+
+| Preset | What it does |
+|---|---|
+| Trầm / Deep | −4 semitones, formant −2 |
+| Cao / High | +5 semitones, formant +3 |
+| Trẻ con / Child | +8 semitones, formant +5 |
+| Quái vật / Monster | −8 semitones, formant −5, reverb |
+| Robot | pitch flattened to 110 Hz, echo |
+| Auto-tune | snaps to the nearest note (key + chromatic/major/minor, retune 0–300 ms) |
+| Radio | 300–3400 Hz band + light saturation |
+| Vọng / Echo | 220 ms echo |
+| Hang động / Cave | reverb, −1 semitone |
+
+* **Pitch** uses TD-PSOLA: pitch-synchronous grains (asymmetric raised-cosine windows
+  from mark to mark) are laid down at a new spacing, so the pitch changes while the
+  formants stay, and +5 semitones does not sound like a chipmunk. **Formant** shift
+  resamples each grain (±5 semitones) to change timbre independently.
+* **Pitch detection**: YIN on a 4× decimated copy, 75–800 Hz, every 5 ms; the grain's
+  own mark-to-mark period refines it. On the two real voices it finds 83 % / 92 % of
+  voiced frames, 91–93 % of them within 5 %.
+* Unvoiced sounds and "no change" are reconstructed exactly (unit test: identity within
+  1e-4), so consonants are not smeared.
+* **Latency**: +38 ms while a pitch effect (pitch, formant, auto-tune, robot) is on,
+  nothing otherwise. Switching on/off live crossfades over one 10 ms frame.
+
+Measured on the same real voices (independent autocorrelation pitch reference):
+
+| Effect | Male voice (~100 Hz) | Female voice (~220 Hz) |
+|---|---|---|
+| Deep −4 | median −3.9 st | −4.0 st (95 % of frames within ±1 st) |
+| High +5 | +5.0 st (92 %) | +5.0 st (96 %) |
+| Child +8 | +8.0 st (89 %) | +8.0 st (95 %) |
+| Monster −8 | −7.9 st (74 %) | −8.0 st (88 %) |
+| Robot | 110 Hz, pitch spread ×1.009 (input ×1.41) | 110 Hz, ×1.006 (input ×1.54) |
+| Auto-tune | 66 % of frames within ±0.2 st of a note (input 36 %) | 62 % (input 39 %); median deviation 0.25 → 0.11 st |
+
+Auto-tune on speech is limited by voicing detection (frames not recognised as voiced
+are left alone); on sustained or sung notes it locks fully (unit test).
 
 ## Desktop app
 
@@ -169,6 +227,12 @@ crisp-rs run --virtual-mic --strength 70 --gate light --no-agc
 # A/B: raw microphone through the same latency path
 crisp-rs run --bypass
 
+# voice changer / auto-tune / effects
+crisp-rs run --virtual-mic --voice deep
+crisp-rs run --virtual-mic --pitch 3 --formant 2
+crisp-rs run --virtual-mic --autotune A --scale minor --retune-ms 40
+crisp-rs run --virtual-mic --robot --effect echo
+
 # denoise a recording offline with the same chain (output: 48 kHz mono WAV)
 crisp-rs process meeting.wav meeting-clean.wav --preset balanced
 
@@ -204,7 +268,8 @@ output period                   :   2.67 ms
 | 44.1 kHz both ends (resampled) | 128 | 37.9 ms |
 
 RNNoise alone accounts for 20 ms, so a < 25 ms end-to-end target is not reachable with
-it; ~30 ms is far below what chat apps add over the network.
+it; ~30 ms is far below what chat apps add over the network. Pitch effects add 38 ms
+while enabled.
 
 Where the numbers come from:
 

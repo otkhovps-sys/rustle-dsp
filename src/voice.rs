@@ -23,6 +23,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
+use crate::fx::{FxChain, FxSettings};
+
 pub const SAMPLE_RATE: f32 = 48_000.0;
 const FRAME: usize = crate::denoiser::FRAME_SIZE;
 
@@ -66,15 +68,25 @@ impl GateMode {
     }
 }
 
+/// Voice relief of the Light / Balanced presets, chosen from measurements on
+/// real speech (LibriSpeech + fan/hum/keyboard noise): at 10 dB SNR the
+/// overall SI-SDR peaks around 0.6 and clean-speech distortion keeps falling
+/// with more relief, but at 0 dB SNR VAD false positives let relief raise
+/// the noise in pauses — so the Strong (noisy-room) preset uses none.
+pub const RELIEF_LIGHT: f32 = 0.7;
+pub const RELIEF_BALANCED: f32 = 0.5;
+/// Upper bound of `voice_relief`.
+pub const RELIEF_MAX: f32 = 0.8;
+
 /// Ready-made combinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "gui", derive(serde::Serialize, serde::Deserialize))]
 pub enum Preset {
-    /// Natural voice: 80 % strength + light gate (quiet rooms).
+    /// Most natural voice (70 % voice relief) + light gate (quiet rooms).
     Light,
-    /// Full RNNoise + light gate (recommended default).
+    /// Natural voice (50 % voice relief) + light gate (recommended default).
     Balanced,
-    /// Full RNNoise + strong gate (noisy rooms, open offices, cafés).
+    /// Maximum cleaning, no relief, strong gate (noisy rooms, cafés).
     Strong,
 }
 
@@ -85,6 +97,11 @@ pub struct VoiceSettings {
     pub highpass: bool,
     /// 0.0 = dry only, 1.0 = pure RNNoise.
     pub strength: f32,
+    /// "Keep the voice natural": while voice is detected, the strength is
+    /// reduced by this fraction (0.0..=RELIEF_MAX). Speech masks the residual noise,
+    /// and RNNoise's own artefacts ("watery" voice) are what you would
+    /// otherwise hear; pauses stay fully cleaned.
+    pub voice_relief: f32,
     pub gate: GateMode,
     pub agc: bool,
     /// Pass the (delay-aligned) raw microphone through untouched, for A/B.
@@ -100,25 +117,31 @@ impl Default for VoiceSettings {
 impl VoiceSettings {
     pub fn preset(p: Preset) -> Self {
         match p {
+            // AGC is off in every preset: Discord / Zoom / Meet / Teams all
+            // run their own, and two AGCs in series pump. Enable it only for
+            // apps that have none (OBS, recorders).
             Preset::Light => Self {
                 highpass: true,
-                strength: 0.8,
+                strength: 1.0,
+                voice_relief: RELIEF_LIGHT,
                 gate: GateMode::Light,
-                agc: true,
+                agc: false,
                 bypass: false,
             },
             Preset::Balanced => Self {
                 highpass: true,
                 strength: 1.0,
+                voice_relief: RELIEF_BALANCED,
                 gate: GateMode::Light,
-                agc: true,
+                agc: false,
                 bypass: false,
             },
             Preset::Strong => Self {
                 highpass: true,
                 strength: 1.0,
+                voice_relief: 0.0,
                 gate: GateMode::Strong,
-                agc: true,
+                agc: false,
                 bypass: false,
             },
         }
@@ -132,6 +155,7 @@ impl VoiceSettings {
                 let s = Self::preset(*p);
                 s.highpass == self.highpass
                     && (s.strength - self.strength).abs() < 0.005
+                    && (s.voice_relief - self.voice_relief).abs() < 0.005
                     && s.gate == self.gate
                     && s.agc == self.agc
             })
@@ -143,6 +167,7 @@ impl VoiceSettings {
 pub struct VoiceControls {
     highpass: AtomicBool,
     strength_bits: AtomicU32,
+    relief_bits: AtomicU32,
     gate: AtomicU8,
     agc: AtomicBool,
     bypass: AtomicBool,
@@ -153,6 +178,7 @@ impl VoiceControls {
         let c = Self {
             highpass: AtomicBool::new(false),
             strength_bits: AtomicU32::new(0),
+            relief_bits: AtomicU32::new(0),
             gate: AtomicU8::new(0),
             agc: AtomicBool::new(false),
             bypass: AtomicBool::new(false),
@@ -165,6 +191,8 @@ impl VoiceControls {
         self.highpass.store(s.highpass, Ordering::Relaxed);
         self.strength_bits
             .store(s.strength.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        self.relief_bits
+            .store(s.voice_relief.clamp(0.0, RELIEF_MAX).to_bits(), Ordering::Relaxed);
         self.gate.store(s.gate.to_u8(), Ordering::Relaxed);
         self.agc.store(s.agc, Ordering::Relaxed);
         self.bypass.store(s.bypass, Ordering::Relaxed);
@@ -174,6 +202,7 @@ impl VoiceControls {
         VoiceSettings {
             highpass: self.highpass.load(Ordering::Relaxed),
             strength: f32::from_bits(self.strength_bits.load(Ordering::Relaxed)),
+            voice_relief: f32::from_bits(self.relief_bits.load(Ordering::Relaxed)),
             gate: GateMode::from_u8(self.gate.load(Ordering::Relaxed)),
             agc: self.agc.load(Ordering::Relaxed),
             bypass: self.bypass.load(Ordering::Relaxed),
@@ -198,9 +227,9 @@ fn coeff(ms: f32) -> f32 {
     (-1.0 / (ms * 0.001 * SAMPLE_RATE)).exp()
 }
 
-/// 2nd-order Butterworth high-pass (RBJ cookbook), transposed direct form II.
+/// 2nd-order Butterworth biquad (RBJ cookbook), transposed direct form II.
 #[derive(Debug, Clone)]
-pub struct HighPass {
+pub struct Biquad {
     b0: f32,
     b1: f32,
     b2: f32,
@@ -210,8 +239,16 @@ pub struct HighPass {
     z2: f32,
 }
 
-impl HighPass {
+/// The 80 Hz rumble filter uses the high-pass form.
+pub type HighPass = Biquad;
+
+impl Biquad {
+    /// High-pass (kept as `new` for the rumble filter).
     pub fn new(cutoff_hz: f32) -> Self {
+        Self::highpass(cutoff_hz)
+    }
+
+    pub fn highpass(cutoff_hz: f32) -> Self {
         let w0 = 2.0 * std::f32::consts::PI * cutoff_hz / SAMPLE_RATE;
         let (sin, cos) = w0.sin_cos();
         let alpha = sin / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
@@ -220,6 +257,22 @@ impl HighPass {
             b0: (1.0 + cos) / 2.0 / a0,
             b1: -(1.0 + cos) / a0,
             b2: (1.0 + cos) / 2.0 / a0,
+            a1: -2.0 * cos / a0,
+            a2: (1.0 - alpha) / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
+    pub fn lowpass(cutoff_hz: f32) -> Self {
+        let w0 = 2.0 * std::f32::consts::PI * cutoff_hz / SAMPLE_RATE;
+        let (sin, cos) = w0.sin_cos();
+        let alpha = sin / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
+        let a0 = 1.0 + alpha;
+        Self {
+            b0: (1.0 - cos) / 2.0 / a0,
+            b1: (1.0 - cos) / a0,
+            b2: (1.0 - cos) / 2.0 / a0,
             a1: -2.0 * cos / a0,
             a2: (1.0 - alpha) / a0,
             z1: 0.0,
@@ -301,36 +354,45 @@ impl VoiceGate {
 }
 
 /// Speech-level automatic gain control.
+///
+/// Deliberately slow: it tracks the *average* speech level over about a
+/// second of voiced frames and moves the gain by at most 3 dB/s, so it
+/// corrects "too quiet / too loud" without touching the dynamics of words.
+/// (v0.3.0 reacted per 10 ms frame and audibly squashed every loud
+/// syllable — measured as a 7 dB SI-SDR loss on clean speech.)
 #[derive(Debug, Clone)]
 struct Agc {
+    level_db: f32,
     gain_db: f32,
     applied: f32,
 }
 
 impl Agc {
-    const TARGET_DB: f32 = -20.0; // speech RMS target (dBFS)
-    const MAX_DB: f32 = 18.0;
-    const MIN_DB: f32 = -10.0;
-    const MIN_SPEECH_DB: f32 = -55.0; // ignore near-silent frames
-    const UP_RATE: f32 = 0.02; // per speech frame (slow: ~0.5 s)
-    const DOWN_RATE: f32 = 0.15; // per speech frame (fast: loud speech)
+    const TARGET_DB: f32 = -23.0; // long-term speech RMS target (dBFS)
+    const MAX_DB: f32 = 12.0;
+    const MIN_DB: f32 = -6.0;
+    const MIN_SPEECH_DB: f32 = -50.0; // ignore near-silent frames
+    const LEVEL_ALPHA: f32 = 0.01; // per voiced frame: ~1 s of speech
+    const MAX_STEP_DB: f32 = 0.03; // per frame = 3 dB/s
 
     fn new() -> Self {
         Self {
+            level_db: Self::TARGET_DB,
             gain_db: 0.0,
             applied: 1.0,
         }
     }
 
+    /// `frame` is measured *before* this stage's gain (input level).
     fn process(&mut self, frame: &mut [f32], vad: f32, enabled: bool) {
-        if enabled && vad > 0.7 {
+        if enabled && vad > 0.8 {
             let rms = (frame.iter().map(|v| v * v).sum::<f32>() / frame.len() as f32).sqrt();
             let rms_db = gain_to_db(rms);
             if rms_db > Self::MIN_SPEECH_DB {
-                let want = (Self::TARGET_DB - rms_db).clamp(Self::MIN_DB, Self::MAX_DB);
-                let rate = if want < self.gain_db { Self::DOWN_RATE } else { Self::UP_RATE };
-                self.gain_db += (want - self.gain_db) * rate;
+                self.level_db += (rms_db - self.level_db) * Self::LEVEL_ALPHA;
             }
+            let want = (Self::TARGET_DB - self.level_db).clamp(Self::MIN_DB, Self::MAX_DB);
+            self.gain_db += (want - self.gain_db).clamp(-Self::MAX_STEP_DB, Self::MAX_STEP_DB);
         }
         let target = if enabled { db_to_gain(self.gain_db) } else { 1.0 };
         // Ramp linearly across the frame: no zipper noise.
@@ -345,14 +407,20 @@ impl Agc {
 
 /// Peak limiter: instant attack (no overshoot possible), 60 ms release.
 #[derive(Debug, Clone)]
-struct Limiter {
+pub struct Limiter {
     env: f32,
     release: f32,
     ceiling: f32,
 }
 
+impl Default for Limiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Limiter {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             env: 0.0,
             release: coeff(60.0),
@@ -360,7 +428,7 @@ impl Limiter {
         }
     }
 
-    fn process(&mut self, frame: &mut [f32]) {
+    pub fn process(&mut self, frame: &mut [f32]) {
         for x in frame.iter_mut() {
             self.env = x.abs().max(self.env * self.release);
             if self.env > self.ceiling {
@@ -380,6 +448,10 @@ pub struct VoiceChain {
     gate: VoiceGate,
     agc: Agc,
     limiter: Limiter,
+    /// Smoothed VAD for the speech-aware strength (no fast modulation).
+    vad_smooth: f32,
+    /// Mix factor applied at the end of the previous frame (ramped).
+    k_prev: f32,
 }
 
 impl Default for VoiceChain {
@@ -394,6 +466,8 @@ impl VoiceChain {
             gate: VoiceGate::new(),
             agc: Agc::new(),
             limiter: Limiter::new(),
+            vad_smooth: 0.0,
+            k_prev: 1.0,
         }
     }
 
@@ -411,10 +485,19 @@ impl VoiceChain {
             out.copy_from_slice(dry);
             return;
         }
-        let k = s.strength.clamp(0.0, 1.0);
+        // Speech-aware strength: full cleaning in pauses, `voice_relief`
+        // less while someone talks. VAD is smoothed (~30 ms) and the mix
+        // factor ramps across the frame, so there is no audible modulation.
+        self.vad_smooth += (vad - self.vad_smooth) * 0.3;
+        let relief = s.voice_relief.clamp(0.0, RELIEF_MAX) * self.vad_smooth;
+        let k = (s.strength.clamp(0.0, 1.0) * (1.0 - relief)).clamp(0.0, 1.0);
+        let step = (k - self.k_prev) / FRAME as f32;
+        let mut kk = self.k_prev;
         for ((o, d), r) in out.iter_mut().zip(denoised).zip(dry) {
-            *o = k * d + (1.0 - k) * r;
+            kk += step;
+            *o = kk * d + (1.0 - kk) * r;
         }
+        self.k_prev = k;
         self.gate.update(vad);
         if s.gate != GateMode::Off {
             self.gate.process(out, s.gate.floor_gain());
@@ -467,10 +550,13 @@ mod tests {
         let den = [0.1f32; FRAME];
         let dry = [0.3f32; FRAME];
         let mut out = [0.0f32; FRAME];
-        let mut s = VoiceSettings { highpass: false, strength: 0.0, gate: GateMode::Off, agc: false, bypass: false };
+        let mut s = VoiceSettings { highpass: false, strength: 0.0, voice_relief: 0.0, gate: GateMode::Off, agc: false, bypass: false };
+        // The mix factor ramps over one frame; the second frame is steady.
+        c.process(&den, &dry, 1.0, &s, &mut out);
         c.process(&den, &dry, 1.0, &s, &mut out);
         assert!(out.iter().all(|v| (v - 0.3).abs() < 1e-6));
         s.strength = 1.0;
+        c.process(&den, &dry, 1.0, &s, &mut out);
         c.process(&den, &dry, 1.0, &s, &mut out);
         assert!(out.iter().all(|v| (v - 0.1).abs() < 1e-6));
     }
@@ -478,7 +564,7 @@ mod tests {
     #[test]
     fn gate_holds_then_closes_to_floor_and_reopens_fast() {
         let mut c = VoiceChain::new();
-        let s = VoiceSettings { highpass: false, strength: 1.0, gate: GateMode::Strong, agc: false, bypass: false };
+        let s = VoiceSettings { highpass: false, strength: 1.0, voice_relief: 0.0, gate: GateMode::Strong, agc: false, bypass: false };
         let x = [0.2f32; FRAME];
         let mut out = [0.0f32; FRAME];
         // Speech, then silence-probability frames.
@@ -504,7 +590,7 @@ mod tests {
     #[test]
     fn agc_raises_quiet_speech_but_not_noise() {
         let mut c = VoiceChain::new();
-        let s = VoiceSettings { highpass: false, strength: 1.0, gate: GateMode::Off, agc: true, bypass: false };
+        let s = VoiceSettings { highpass: false, strength: 1.0, voice_relief: 0.0, gate: GateMode::Off, agc: true, bypass: false };
         let quiet = sine(200.0, FRAME, 0.02); // ≈ -37 dBFS RMS
         let mut out = [0.0f32; FRAME];
         // Noise-only frames (VAD low) must not move the gain.
@@ -512,16 +598,56 @@ mod tests {
             c.process(&quiet, &quiet, 0.1, &s, &mut out);
         }
         assert!(c.agc_gain_db().abs() < 0.01);
-        for _ in 0..400 {
+        // Slow by design (≤ 3 dB/s, ~1 s level estimate): after 10 s of
+        // speech the +12 dB cap is reached.
+        for _ in 0..1000 {
             c.process(&quiet, &quiet, 0.95, &s, &mut out);
         }
-        assert!((c.agc_gain_db() - 17.0).abs() < 1.5, "gain {} dB", c.agc_gain_db());
+        assert!((c.agc_gain_db() - 12.0).abs() < 0.5, "gain {} dB", c.agc_gain_db());
+    }
+
+    #[test]
+    fn agc_does_not_pump_on_syllables() {
+        // Speech-like dynamics: 120 ms loud (-14 dBFS) / 80 ms soft (-34 dBFS).
+        let mut c = VoiceChain::new();
+        let s = VoiceSettings { highpass: false, strength: 1.0, voice_relief: 0.0, gate: GateMode::Off, agc: true, bypass: false };
+        let loud = sine(220.0, FRAME, 0.28);
+        let soft = sine(220.0, FRAME, 0.028);
+        let mut out = [0.0f32; FRAME];
+        let mut gains = Vec::new();
+        for i in 0..600 {
+            let x = if i % 20 < 12 { &loud } else { &soft };
+            c.process(x, x, 0.95, &s, &mut out);
+            if i >= 500 {
+                gains.push(c.agc_gain_db());
+            }
+        }
+        let (lo, hi) = gains.iter().fold((f32::MAX, f32::MIN), |(a, b), g| (a.min(*g), b.max(*g)));
+        // v0.3.0 swung by several dB within each syllable cycle.
+        assert!(hi - lo < 0.7, "gain swing {:.2} dB within syllables", hi - lo);
+    }
+
+    #[test]
+    fn voice_relief_mixes_dry_only_while_talking() {
+        let mut c = VoiceChain::new();
+        let s = VoiceSettings { highpass: false, strength: 1.0, voice_relief: 0.25, gate: GateMode::Off, agc: false, bypass: false };
+        let den = [0.0f32; FRAME];
+        let dry = [1.0f32; FRAME];
+        let mut out = [0.0f32; FRAME];
+        for _ in 0..50 {
+            c.process(&den, &dry, 0.0, &s, &mut out);
+        }
+        assert!(out[FRAME - 1].abs() < 1e-3, "pause must be fully cleaned: {}", out[FRAME - 1]);
+        for _ in 0..50 {
+            c.process(&den, &dry, 1.0, &s, &mut out);
+        }
+        assert!((out[FRAME - 1] - 0.25).abs() < 0.01, "speech keeps 25 % dry: {}", out[FRAME - 1]);
     }
 
     #[test]
     fn limiter_never_exceeds_ceiling() {
         let mut c = VoiceChain::new();
-        let s = VoiceSettings { highpass: false, strength: 1.0, gate: GateMode::Off, agc: true, bypass: false };
+        let s = VoiceSettings { highpass: false, strength: 1.0, voice_relief: 0.0, gate: GateMode::Off, agc: true, bypass: false };
         let loud = sine(300.0, FRAME, 0.99);
         let mut out = [0.0f32; FRAME];
         for _ in 0..300 {
@@ -558,12 +684,15 @@ mod tests {
 // Complete 48 kHz voice processor (used by the real-time worker and offline)
 // ---------------------------------------------------------------------------
 
-/// High-pass → RNNoise → [`VoiceChain`], fed with arbitrary-length 48 kHz
-/// mono slices. Output lags input by [`crate::denoiser::MODEL_DELAY`].
+/// High-pass → RNNoise → [`VoiceChain`] → voice effects ([`FxChain`]), fed
+/// with arbitrary-length 48 kHz mono slices. Output lags input by
+/// [`crate::denoiser::MODEL_DELAY`] plus [`FxChain::latency`] (0 unless a
+/// pitch effect is enabled).
 pub struct VoiceProcessor {
     highpass: HighPass,
     denoiser: crate::denoiser::Denoiser,
     chain: VoiceChain,
+    fx: FxChain,
     /// Scratch for the high-passed input (sized for the largest push).
     pre: Vec<f32>,
     frame: [f32; FRAME],
@@ -576,6 +705,7 @@ impl VoiceProcessor {
             highpass: HighPass::new(80.0),
             denoiser: crate::denoiser::Denoiser::new(),
             chain: VoiceChain::new(),
+            fx: FxChain::new(),
             pre: Vec::with_capacity(max_push),
             frame: [0.0; FRAME],
         }
@@ -601,9 +731,20 @@ impl VoiceProcessor {
         self.chain.gate_gain()
     }
 
-    /// Process `input` with settings `s`; every finished 480-sample frame is
-    /// passed to `sink`.
-    pub fn process(&mut self, input: &[f32], s: &VoiceSettings, sink: &mut dyn FnMut(&[f32])) {
+    /// Latency currently added by the effects stage (samples).
+    pub fn fx_latency(&self) -> usize {
+        self.fx.latency()
+    }
+
+    /// Process `input` with noise-reduction settings `s` and effects `fx`;
+    /// every finished 480-sample frame is passed to `sink`.
+    pub fn process(
+        &mut self,
+        input: &[f32],
+        s: &VoiceSettings,
+        fx: &FxSettings,
+        sink: &mut dyn FnMut(&[f32]),
+    ) {
         self.pre.clear();
         self.pre.extend_from_slice(input);
         if s.highpass && !s.bypass {
@@ -612,21 +753,25 @@ impl VoiceProcessor {
         let Self {
             denoiser,
             chain,
+            fx: fx_chain,
             pre,
             frame,
             ..
         } = self;
         denoiser.push(pre, &mut |den, dry, vad| {
             chain.process(den, dry, vad, s, frame);
+            fx_chain.process(frame, fx, s.bypass);
             sink(&frame[..]);
         });
     }
 
-    /// Emit everything still held (partial frame + model delay).
-    pub fn flush(&mut self, s: &VoiceSettings, sink: &mut dyn FnMut(&[f32])) {
+    /// Emit everything still held (partial frame, model delay, effects
+    /// look-ahead).
+    pub fn flush(&mut self, s: &VoiceSettings, fx: &FxSettings, sink: &mut dyn FnMut(&[f32])) {
         let Self {
             denoiser,
             chain,
+            fx: fx_chain,
             frame,
             ..
         } = self;
@@ -639,21 +784,37 @@ impl VoiceProcessor {
             den_pad[..n].copy_from_slice(den);
             dry_pad[..n].copy_from_slice(dry);
             chain.process(&den_pad, &dry_pad, vad, s, frame);
+            fx_chain.process(&mut frame[..n], fx, s.bypass);
             sink(&frame[..n]);
         });
+        // Drain the effects look-ahead with silence.
+        let mut left = fx_chain.latency();
+        while left > 0 {
+            let n = left.min(FRAME);
+            frame[..n].fill(0.0);
+            fx_chain.process(&mut frame[..n], fx, s.bypass);
+            sink(&frame[..n]);
+            left -= n;
+        }
     }
 }
 
-/// Offline helper: process a whole 48 kHz mono buffer and return a buffer of
-/// the same length, already compensated for the model delay.
+/// Offline helper: process a whole 48 kHz mono buffer (noise reduction only)
+/// and return a buffer of the same length, compensated for the model delay.
 pub fn process_buffer(input: &[f32], s: &VoiceSettings) -> Vec<f32> {
+    process_buffer_fx(input, s, &FxSettings::default())
+}
+
+/// Like [`process_buffer`] with voice effects; compensates their latency too.
+pub fn process_buffer_fx(input: &[f32], s: &VoiceSettings, fx: &FxSettings) -> Vec<f32> {
     let mut p = VoiceProcessor::new(4096);
-    let mut out = Vec::with_capacity(input.len() + FRAME);
+    let mut out = Vec::with_capacity(input.len() + FRAME + crate::fx::FX_LATENCY);
     for chunk in input.chunks(4096) {
-        p.process(chunk, s, &mut |f| out.extend_from_slice(f));
+        p.process(chunk, s, fx, &mut |f| out.extend_from_slice(f));
     }
-    p.flush(s, &mut |f| out.extend_from_slice(f));
-    out.drain(..crate::denoiser::MODEL_DELAY.min(out.len()));
+    let delay = crate::denoiser::MODEL_DELAY + p.fx_latency();
+    p.flush(s, fx, &mut |f| out.extend_from_slice(f));
+    out.drain(..delay.min(out.len()));
     out.truncate(input.len());
     out
 }
@@ -661,6 +822,18 @@ pub fn process_buffer(input: &[f32], s: &VoiceSettings) -> Vec<f32> {
 #[cfg(test)]
 mod processor_tests {
     use super::*;
+
+    #[test]
+    fn effects_keep_length_and_alignment_in_bypass() {
+        // A/B with a pitch effect selected: same latency path, exact input.
+        let input: Vec<f32> = (0..48_000 + 77).map(|i| ((i * 13) % 89) as f32 / 300.0 - 0.15).collect();
+        let s = VoiceSettings { bypass: true, ..VoiceSettings::default() };
+        let fx = crate::fx::FxSettings::preset(crate::fx::FxPreset::Deep);
+        let out = process_buffer_fx(&input, &s, &fx);
+        assert_eq!(out.len(), input.len());
+        let err = out.iter().zip(&input).skip(4_000).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(err < 1e-4, "max error {err}");
+    }
 
     #[test]
     fn process_buffer_preserves_length_and_alignment_in_bypass() {
